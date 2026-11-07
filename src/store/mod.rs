@@ -13,7 +13,7 @@ pub mod manifest;
 use crate::fs::{ensure_dir, random_hex};
 use crate::json::{Map, Value, encode};
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,11 +59,11 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(hex(&hasher.finalize()))
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `clonefile(2)` on macOS, `ioctl(FICLONE)` on Linux: one copy-on-write clone per file.
@@ -194,8 +194,19 @@ impl Store {
 
     /// Copies every regular file under `dir` into the store and writes the index entry for `key`.
     pub fn ingest(&self, key: &str, dir: &Path) -> Result<(), String> {
+        self.ingest_with_hashes(key, dir, &HashMap::new())
+    }
+
+    /// `ingest`, trusting `hashes` (path under `dir` -> sha256, as computed while extracting)
+    /// instead of rereading those files; any file missing from it is hashed from disk.
+    pub fn ingest_with_hashes(
+        &self,
+        key: &str,
+        dir: &Path,
+        hashes: &HashMap<PathBuf, String>,
+    ) -> Result<(), String> {
         let mut entry = IndexEntry::default();
-        self.walk(dir, dir, &mut entry)?;
+        self.walk(dir, dir, hashes, &mut entry)?;
         let index = self.index_path(key)?;
         ensure_dir(index.parent().unwrap())?;
         let tmp = PathBuf::from(format!("{}.{}", index.display(), random_hex(4)));
@@ -206,7 +217,13 @@ impl Store {
         Ok(())
     }
 
-    fn walk(&self, root: &Path, dir: &Path, entry: &mut IndexEntry) -> Result<(), String> {
+    fn walk(
+        &self,
+        root: &Path,
+        dir: &Path,
+        hashes: &HashMap<PathBuf, String>,
+        entry: &mut IndexEntry,
+    ) -> Result<(), String> {
         for item in std::fs::read_dir(dir)
             .map_err(|e| format!("Cannot read {}: {e}", dir.display()))?
             .flatten()
@@ -230,12 +247,15 @@ impl Store {
                 {
                     entry.dirs.push(relative);
                 } else {
-                    self.walk(root, &path, entry)?;
+                    self.walk(root, &path, hashes, entry)?;
                 }
             } else if meta.is_file() {
                 let executable = meta.permissions().mode() & 0o111 != 0;
-                let hash = sha256_file(&path)
-                    .map_err(|e| format!("Cannot hash {}: {e}", path.display()))?;
+                let hash = match hashes.get(&path) {
+                    Some(hash) => hash.clone(),
+                    None => sha256_file(&path)
+                        .map_err(|e| format!("Cannot hash {}: {e}", path.display()))?,
+                };
                 self.put(&self.file_path(&hash, executable), &path, executable)?;
                 entry.files.insert(
                     relative,
@@ -663,6 +683,26 @@ mod tests {
         std::fs::set_permissions(dir.join("bin/run"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         std::os::unix::fs::symlink("src/A.php", dir.join("link.php")).unwrap();
+    }
+
+    #[test]
+    fn ingest_with_hashes_trusts_given_hashes_and_hashes_the_rest() {
+        let base = temp("ingest-hashes");
+        let pkg = base.join("pkg");
+        sample_package(&pkg);
+        let given = "ab".repeat(32);
+        let hashes = std::collections::HashMap::from([(pkg.join("src/A.php"), given.clone())]);
+        let store = Store::new(base.join("store"));
+        store
+            .ingest_with_hashes("acme/lib@1.0.0.0-abc", &pkg, &hashes)
+            .unwrap();
+        let entry = store.entry("acme/lib@1.0.0.0-abc").unwrap();
+        assert_eq!(entry.files["src/A.php"].hash, given);
+        assert_eq!(
+            entry.files["src/B.php"].hash,
+            sha256_file(&pkg.join("src/B.php")).unwrap()
+        );
+        assert!(base.join("store/files/ab").join(&given).is_file());
     }
 
     #[test]

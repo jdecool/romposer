@@ -6,7 +6,7 @@
 
 use crate::binaries::BinaryInstaller;
 use crate::config::Config;
-use crate::download::{Downloader, extract_zip};
+use crate::download::{Downloader, extract_zip_hashed};
 use crate::fs::{ensure_dir, is_dir_empty, realpath, remove};
 use crate::installed::InstalledRepository;
 use crate::io::Io;
@@ -1728,9 +1728,10 @@ impl FilesystemRun<'_> {
                 }
             }
             ensure_dir(&temporary_dir)?;
-            let result = extract_zip(&archive, &temporary_dir).and_then(|()| {
+            let result = extract_zip_hashed(&archive, &temporary_dir).and_then(|hashes| {
                 let _ = remove(&archive);
-                run.store.ingest(&key, &package_root(&temporary_dir))
+                run.store
+                    .ingest_with_hashes(&key, &package_root(&temporary_dir), &hashes)
             });
             let _ = remove(&temporary_dir);
             if let Err(e) = result {

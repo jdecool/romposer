@@ -798,6 +798,43 @@ fn check_tree(archive: &Path, root: &Path, dir: &Path, writable: bool) -> Result
 /// Regular entries are written first and symlinks last, so no entry is ever written
 /// through a link, and a link may only point inside the extraction root.
 pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
+    unzip(archive, target, None)
+}
+
+/// `extract_zip`, also returning the sha256 of every regular file written, keyed by its path,
+/// hashed while inflating. Empty when an entry landed on an existing file (duplicate name,
+/// case or unicode folding): the path no longer tells which entry's bytes are on disk.
+pub fn extract_zip_hashed(
+    archive: &Path,
+    target: &Path,
+) -> Result<HashMap<PathBuf, String>, String> {
+    let mut hashes = HashMap::new();
+    unzip(archive, target, Some(&mut hashes))?;
+    Ok(hashes)
+}
+
+/// Writes through to the file, feeding the hasher with what was written.
+struct Hashing<'a>(&'a mut std::fs::File, Option<&'a mut sha2::Sha256>);
+
+impl std::io::Write for Hashing<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.0.write(buf)?;
+        if let Some(hasher) = self.1.as_mut() {
+            sha2::Digest::update(&mut **hasher, &buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn unzip(
+    archive: &Path,
+    target: &Path,
+    mut hashes: Option<&mut HashMap<PathBuf, String>>,
+) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| format!("Failed to extract {}: {e}", archive.display()))?;
@@ -827,9 +864,31 @@ pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
             symlinks.push((out, link));
             continue;
         }
-        let mut dest = std::fs::File::create(&out)
-            .map_err(|e| format!("Could not create {}: {e}", out.display()))?;
-        std::io::copy(&mut entry, &mut dest).map_err(|e| e.to_string())?;
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out);
+        let mut dest = match created {
+            // ponytail: any collision voids every hash (full rehash in ingest), drop only the
+            // folded paths if such zips ever show up in profiles
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(h) = hashes.take() {
+                    h.clear();
+                }
+                std::fs::File::create(&out)
+            }
+            other => other,
+        }
+        .map_err(|e| format!("Could not create {}: {e}", out.display()))?;
+        let mut hasher = hashes.is_some().then(<sha2::Sha256 as sha2::Digest>::new);
+        std::io::copy(&mut entry, &mut Hashing(&mut dest, hasher.as_mut()))
+            .map_err(|e| e.to_string())?;
+        if let (Some(h), Some(hasher)) = (hashes.as_mut(), hasher) {
+            h.insert(
+                out.clone(),
+                crate::store::hex(&sha2::Digest::finalize(hasher)),
+            );
+        }
         let perm = match mode {
             Some(m) if m & 0o777 != 0 => m & 0o777,
             _ => 0o666 & !umask,
@@ -1176,6 +1235,44 @@ impl Http {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_of(path: &Path, files: &[(&str, &str, u32)]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, body, mode) in files {
+            let options = zip::write::SimpleFileOptions::default().unix_permissions(*mode);
+            zip.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut zip, body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_zip_hashed_hashes_while_inflating() {
+        let base = std::env::temp_dir().join(format!("romposer-unzip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("out")).unwrap();
+        let archive = base.join("a.zip");
+        zip_of(
+            &archive,
+            &[("pkg/a.txt", "a", 0o644), ("pkg/bin/run", "", 0o755)],
+        );
+        let hashes = extract_zip_hashed(&archive, &base.join("out")).unwrap();
+        assert_eq!(
+            hashes[&base.join("out/pkg/a.txt")],
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+        assert_eq!(
+            hashes[&base.join("out/pkg/bin/run")],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // a name landing on an existing file (duplicate, case or unicode folding) voids every hash
+        let hashes = extract_zip_hashed(&archive, &base.join("out")).unwrap();
+        assert!(hashes.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(base.join("out/pkg/a.txt")).unwrap(),
+            "a"
+        );
+    }
 
     #[test]
     fn github_dist_urls_are_rewritten_to_the_api_with_the_reference() {
