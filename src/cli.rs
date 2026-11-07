@@ -98,6 +98,25 @@ enum Command {
     RunScript(commands::run_script::RunScriptArgs),
     /// Executes a vendored binary/script.
     Exec(commands::run_script::ExecArgs),
+    /// Sets config options.
+    Config(commands::config::Args),
+    /// Creates an archive of this composer package.
+    Archive(commands::archive::Args),
+    /// Creates new project from a package into given directory.
+    #[command(name = "create-project")]
+    CreateProject(commands::create_project::Args),
+    /// Diagnoses the system to identify common errors.
+    Diagnose(commands::diagnose::Args),
+    /// Creates a basic composer.json file in current directory.
+    Init(commands::init::Args),
+    /// Clears composer's internal package cache.
+    #[command(name = "clear-cache", visible_aliases = ["clearcache", "cc"])]
+    ClearCache(commands::clear_cache::Args),
+    /// Allows running commands in the global composer dir ($COMPOSER_HOME).
+    Global {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
     /// A script of composer.json run as its own command (`ScriptAliasCommand`).
     #[command(external_subcommand)]
     Script(Vec<String>),
@@ -105,7 +124,39 @@ enum Command {
 
 /// Runs the CLI and returns the process exit code.
 pub fn run() -> i32 {
-    let cli = Cli::parse();
+    run_from(std::env::args().collect())
+}
+
+/// `GlobalCommand`: the same command line without its `global` token, run from the home dir.
+fn global(argv: &[String], io: &mut Io) -> i32 {
+    // the COMPOSER env var does not apply to the global scope
+    // SAFETY: single-threaded here, before any command spawns threads
+    unsafe { std::env::remove_var("COMPOSER") };
+    let home = match crate::config::Config::create(&crate::fs::cwd()) {
+        Ok(config) => config.get_str("home"),
+        Err(e) => return crate::scripts::exit_code(io, &e),
+    };
+    if crate::fs::ensure_dir(std::path::Path::new(&home)).is_err() {
+        return crate::scripts::exit_code(io, "Could not create home directory");
+    }
+    if std::env::set_current_dir(&home).is_err() {
+        return crate::scripts::exit_code(
+            io,
+            &format!("Could not switch to home directory \"{home}\""),
+        );
+    }
+    io.error(&format!("Changed current directory to {home}"));
+    let token = regex::Regex::new(r"^g(?:l(?:o(?:b(?:a(?:l)?)?)?)?)?$").unwrap();
+    let mut argv = argv.to_vec();
+    if let Some(i) = argv.iter().skip(1).position(|a| token.is_match(a)) {
+        argv.remove(i + 1);
+    }
+    run_from(argv)
+}
+
+/// Runs a command line (program name first).
+pub fn run_from(argv: Vec<String>) -> i32 {
+    let cli = Cli::parse_from(&argv);
     if cli.version {
         println!("{VERSION_LINE}");
         return 0;
@@ -142,6 +193,13 @@ pub fn run() -> i32 {
         Some(Command::Prohibits(args)) => commands::depends::prohibits(&args, &mut io),
         Some(Command::RunScript(args)) => commands::run_script::run_script(&args, &mut io),
         Some(Command::Exec(args)) => commands::run_script::exec(&args, &mut io),
+        Some(Command::Config(args)) => commands::config::run(&args, &mut io),
+        Some(Command::Archive(args)) => commands::archive::run(&args, &mut io),
+        Some(Command::CreateProject(args)) => commands::create_project::run(&args, &mut io),
+        Some(Command::Diagnose(args)) => commands::diagnose::run(&args, &mut io),
+        Some(Command::Init(args)) => commands::init::run(&args, &mut io),
+        Some(Command::ClearCache(args)) => commands::clear_cache::run(&args, &mut io),
+        Some(Command::Global { .. }) => global(&argv, &mut io),
         Some(Command::Script(argv)) => commands::run_script::alias(&argv[0], &argv[1..], &mut io),
         Some(Command::CheckPlatformReqs(args)) => {
             commands::check_platform_reqs::run(&args, &mut io)

@@ -17,6 +17,7 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 | `show` / `search` golden cases vs composer | 31 on a recorded Packagist + live `show symfony/console -a --format=json` |
 | `audit` vs composer | 30 invocations identical (every format, `--locked`, installed, ignore rules, `install --audit`) on a live project pinning a vulnerable guzzle |
 | scripts and events vs composer | every event in the same order, 52 invocations identical (installer events, `run-script`, `exec`, script aliases, failing listeners) |
+| project commands vs composer | 83 `config` invocations (get, set, unset, `--list`, `--global`, `--json`, `--merge`, `--append`, auth keys), 17 `init`/`global`, 4 `clear-cache`, 6 `archive` entry listings, and 9 `create-project` runs identical; `create-project symfony/skeleton --no-plugins` gives the same lock and file listing |
 | `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
 
 ## Install
@@ -32,7 +33,9 @@ macOS and Linux only.
 - PHP Composer plugins are installed but never executed (a warning names them).
 - PHP class callbacks in `scripts` are skipped with a warning; shell scripts run as with Composer.
 - svn, hg, fossil and perforce repositories are not supported.
-- No `self-update`.
+- No `self-update`; `diagnose` keeps only the checks that apply to romposer and adds the store.
+- `config --editor` and `config --source` are not supported.
+- `archive` archives the current project only, with the same entries as Composer but not the same bytes.
 - No Windows.
 - Human-readable console output is close to Composer's but not byte-identical; machine outputs are.
 

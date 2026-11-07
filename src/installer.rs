@@ -1388,13 +1388,18 @@ impl FilesystemRun<'_> {
             if let Some(plugin) = plugin {
                 // ponytail: plugins are installed, never activated; the warning stands in for
                 // `PluginManager::registerPackage`
-                if plugin.kind == "composer-plugin"
-                    && !crate::scripts::NO_PLUGINS.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.io.warning(&format!(
-                        "{} is a Composer plugin: romposer installed it but does not execute plugins",
-                        plugin.pretty_name
-                    ));
+                if plugin.kind == "composer-plugin" {
+                    if crate::scripts::NO_PLUGINS.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.io.warning(&format!(
+                            "The \"{}\" plugin was not loaded as plugins are disabled.",
+                            plugin.name
+                        ));
+                    } else {
+                        self.io.warning(&format!(
+                            "{} is a Composer plugin: romposer installed it but does not execute plugins",
+                            plugin.pretty_name
+                        ));
+                    }
                 }
                 self.fire_post_events(&mut post_events)?;
             }

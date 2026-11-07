@@ -46,8 +46,8 @@ static PLAIN_VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[^,\s@]+$
 static REFERENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[^,\s@]+?#([a-f0-9]+)$").unwrap());
 
-/// `RootPackageLoader::load` without version guessing: a missing `version` is
-/// `1.0.0` (Composer's own fallback when git gives nothing).
+/// `RootPackageLoader::load` without git version guessing: a missing `version` is
+/// `COMPOSER_ROOT_VERSION`, else `1.0.0` (Composer's own fallback when git gives nothing).
 pub fn load_root(config: &Map<String, Value>) -> Result<RootPackage, String> {
     let mut config = config.clone();
     match config.get("name").and_then(Value::as_str) {
@@ -61,6 +61,20 @@ pub fn load_root(config: &Map<String, Value>) -> Result<RootPackage, String> {
         }
     }
     let mut auto_versioned = false;
+    if !config.contains_key("version")
+        && let Some(version) =
+            crate::scripts::get_env("COMPOSER_ROOT_VERSION").filter(|v| !v.is_empty())
+    {
+        // `VersionGuesser::getRootVersionFromEnv`
+        let version = match Regex::new(r"(?i)^(\d+(?:\.\d+)*)-dev$")
+            .unwrap()
+            .captures(&version)
+        {
+            Some(m) => format!("{}.x-dev", &m[1]),
+            None => version,
+        };
+        config.insert("version".into(), Value::String(version));
+    }
     if !config.contains_key("version") {
         config.insert("version".into(), Value::String("1.0.0".into()));
         auto_versioned = true;

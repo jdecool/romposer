@@ -130,7 +130,7 @@ pub struct Config {
     pub base_dir: Option<String>,
 }
 
-/// `Config::$defaultConfig`
+/// `Config::$defaultConfig`, in Composer's key order (`config --list` prints it).
 const DEFAULTS: &str = r#"{
     "process-timeout": 300,
     "use-include-path": false,
@@ -138,6 +138,7 @@ const DEFAULTS: &str = r#"{
     "use-parent-dir": "prompt",
     "preferred-install": "dist",
     "audit": {"ignore": [], "abandoned": "fail"},
+    "policy": true,
     "notify-on-install": true,
     "github-protocols": ["https", "ssh", "git"],
     "gitlab-protocol": null,
@@ -157,9 +158,11 @@ const DEFAULTS: &str = r#"{
     "autoloader-suffix": null,
     "sort-packages": false,
     "optimize-autoloader": false,
+    "strict-psr-autoloader": false,
     "classmap-authoritative": false,
     "apcu-autoloader": false,
     "prepend-autoloader": true,
+    "update-with-minimal-changes": false,
     "github-domains": ["github.com"],
     "bitbucket-expose-hostname": true,
     "disable-tls": false,
@@ -169,7 +172,6 @@ const DEFAULTS: &str = r#"{
     "capath": null,
     "github-expose-hostname": true,
     "gitlab-domains": ["gitlab.com"],
-    "forgejo-domains": [],
     "store-auths": "prompt",
     "platform": {},
     "archive-format": "tar",
@@ -178,10 +180,6 @@ const DEFAULTS: &str = r#"{
     "use-github-api": true,
     "lock": true,
     "platform-check": "php-only",
-    "bump-after-update": false,
-    "allow-missing-requirements": false,
-    "source-fallback": false,
-    "strict-psr-autoloader": false,
     "bitbucket-oauth": {},
     "github-oauth": {},
     "gitlab-oauth": {},
@@ -189,8 +187,12 @@ const DEFAULTS: &str = r#"{
     "http-basic": {},
     "bearer": {},
     "custom-headers": {},
+    "bump-after-update": false,
+    "allow-missing-requirements": false,
     "client-certificate": {},
-    "forgejo-token": {}
+    "forgejo-domains": ["codeberg.org"],
+    "forgejo-token": {},
+    "source-fallback": false
 }"#;
 
 fn defaults() -> Map<String, Value> {
