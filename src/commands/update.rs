@@ -188,13 +188,6 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         }
     }
 
-    let mut executor = crate::installer::FilesystemExecutor;
-    let http = std::rc::Rc::new(crate::download::Http::new(&config)?);
-    let mut composer_repos = crate::repository::from_config(&config, http)?;
-    let repos: Vec<Repository> = composer_repos
-        .iter_mut()
-        .map(Repository::Composer)
-        .collect();
     let mut options = Options::defaults();
     options.update = true;
     options.install = !args.no_install;
@@ -239,13 +232,33 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     options.minimal_update = args.minimal_changes || config.bool("update-with-minimal-changes");
     options.temporary_constraints = temporary_constraints;
     options.write_lock = config.bool("lock");
+    run_installer(io, &file, &contents, &root, &config, lock, options).map(|(status, _)| status)
+}
+
+/// Builds the installer on the project's repositories and runs it.
+pub fn run_installer(
+    io: &mut Io,
+    file: &std::path::Path,
+    contents: &str,
+    root: &crate::package::root::RootPackage,
+    config: &crate::config::Config,
+    lock: Option<crate::lock::Lock>,
+    options: Options,
+) -> Result<(i32, Option<crate::lock::Lock>), String> {
+    let mut executor = crate::installer::FilesystemExecutor;
+    let http = std::rc::Rc::new(crate::download::Http::new(config)?);
+    let mut composer_repos = crate::repository::from_config(config, http)?;
+    let repos: Vec<Repository> = composer_repos
+        .iter_mut()
+        .map(Repository::Composer)
+        .collect();
     let mut installer = Installer {
         io,
-        config: &config,
-        root: &root,
+        config,
+        root,
         lock,
-        lock_path: Some(config::lock_file(&file)),
-        composer_json: &contents,
+        lock_path: Some(config::lock_file(file)),
+        composer_json: contents,
         options,
         executor: &mut executor,
         repos,
@@ -253,5 +266,6 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         written_lock: None,
         suggesting_packages: vec![],
     };
-    installer.run()
+    let status = installer.run()?;
+    Ok((status, installer.lock.take()))
 }

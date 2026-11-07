@@ -126,11 +126,10 @@ fn package_sort(a: &Package, b: &Package) -> std::cmp::Ordering {
 /// `ValidatingArrayLoader::validatePackage`: the security subset re-applied to
 /// packages loaded without validation (installed.json, the lock).
 pub fn validate_package(package: &Package) -> Result<(), String> {
-    // the root package and platform packages are built locally
-    if package.name == "__root__" || is_platform_package(&package.name) {
-        return Ok(());
-    }
-    if let Some(err) = crate::package::naming_error(&package.name, false) {
+    // the root package placeholder and platform package names never pass the naming
+    // check (Composer exempts them by type); their urls and references are still checked
+    let exempt_name = package.name == "__root__" || is_platform_package(&package.name);
+    if !exempt_name && let Some(err) = crate::package::naming_error(&package.name, false) {
         return Err(format!(
             "Invalid package found during dependency resolution, aborting: {err}"
         ));

@@ -6,6 +6,7 @@
 //! that ends up in a file goes through [`writer`].
 
 pub mod lint;
+pub mod manipulator;
 pub mod writer;
 
 pub use serde_json::{Map, Value};

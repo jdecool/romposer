@@ -813,10 +813,21 @@ impl<'a> Installer<'a> {
             self.options.prefer_lowest,
             &crate::platform::overrides_from_config(self.config),
         );
-        let unchanged = self.locked().is_some_and(|l| {
-            crate::lock::php_assoc(Value::Object(l.data.clone()))
-                == crate::lock::php_assoc(lock_data.clone())
-        });
+        // Composer compares the new document (empty stability-flags/platform/platform-dev
+        // are objects) with the parsed file (arrays) using `!==`, so a lock with any of
+        // those empty is always rewritten
+        let fixup_empty = ["stability-flags", "platform", "platform-dev"]
+            .iter()
+            .any(|k| {
+                lock_data
+                    .get(*k)
+                    .is_none_or(|v| v.as_object().is_none_or(|o| o.is_empty()))
+            });
+        let unchanged = !fixup_empty
+            && self.locked().is_some_and(|l| {
+                crate::json::encode_pretty(&Value::Object(l.data.clone()))
+                    == crate::json::encode_pretty(&lock_data)
+            });
         if !unchanged {
             let write = self.options.write_lock && self.options.execute_operations;
             if write {

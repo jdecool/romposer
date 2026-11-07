@@ -203,7 +203,10 @@ pub fn extract_stability_flags(
     }
 }
 
-fn extract_references(requires: &[(String, String)], references: &mut BTreeMap<String, String>) {
+pub fn extract_references(
+    requires: &[(String, String)],
+    references: &mut BTreeMap<String, String>,
+) {
     for (name, version) in requires {
         let req_version = ALIAS_PREFIX.replace(version, "$1").into_owned();
         if let Some(m) = REFERENCE.captures(&req_version)

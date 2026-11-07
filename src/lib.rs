@@ -24,6 +24,7 @@ pub mod spdx;
 pub mod store;
 pub mod transaction;
 pub mod validation;
+pub mod version_selector;
 pub mod zend_sort;
 
 /// Composer version whose observable behaviour romposer reproduces.

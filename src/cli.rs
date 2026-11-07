@@ -49,6 +49,12 @@ enum Command {
     /// Updates your dependencies to the latest version according to composer.json, and updates the composer.lock file.
     #[command(visible_aliases = ["u", "upgrade"])]
     Update(commands::update::Args),
+    /// Adds required packages to your composer.json and installs them.
+    #[command(visible_alias = "r")]
+    Require(commands::require::Args),
+    /// Removes a package from the require or require-dev.
+    #[command(visible_alias = "rm")]
+    Remove(commands::remove::Args),
     /// Dumps the autoloader.
     #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
     DumpAutoload(commands::dump_autoload::Args),
@@ -83,6 +89,8 @@ pub fn run() -> i32 {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
         Some(Command::Update(args)) => commands::update::run(&args, &mut io),
+        Some(Command::Require(args)) => commands::require::run(&args, &mut io),
+        Some(Command::Remove(args)) => commands::remove::run(&args, &mut io),
         Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
         Some(Command::Search(args)) => commands::search::run(&args, &mut io),
