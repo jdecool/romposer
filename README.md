@@ -20,13 +20,26 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 | project commands vs composer | 83 `config` invocations (get, set, unset, `--list`, `--global`, `--json`, `--merge`, `--append`, auth keys), 17 `init`/`global`, 4 `clear-cache`, 6 `archive` entry listings, and 9 `create-project` runs identical; `create-project symfony/skeleton --no-plugins` gives the same lock and file listing |
 | git repositories vs composer | identical lock, `installed.json`, `installed.php` and vendor checkout (HEAD, branches, remotes) for tags, branches, branch aliases, `only-branches`, the bare mirror cache and in-place source updates on a generated repository; a public GitHub package locks identically through the API driver and `no-api` |
 | path, artifact and archive dists vs composer | identical lock, `installed.json`, `installed.php`, autoload, vendor/ listing (symlink targets included), stderr and `status -v` on a generated monorepo: globbed and mirrored `path` packages (one versioned from its git feature branch), an `artifact` directory with a tar.gz library and a zip metapackage, xz and phar dists; none reach the store |
-| `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
+| `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | see [Benchmark](#benchmark) |
+
+## Benchmark
+
+`install` of [Symfony demo](https://github.com/symfony/demo) at `f42980c`, median wall time of 3 runs, from `bench/install.sh 3` (`PCOMPOSER_SRC` pointing at a pcomposer checkout). Cold starts from an empty cache directory (no zip cache, no store), warm keeps it; `vendor/` is deleted before every run. All runs use `--no-scripts`, and the demo's plugins (flex, runtime) are disabled since romposer never runs them.
+
+| install (median of 3) | composer | composer + pcomposer | romposer, store disabled | romposer, store enabled |
+|---|---|---|---|---|
+| cold | 12.04 s | 47.55 s | 14.62 s | 51.04 s |
+| warm | 4.55 s | 10.23 s | 6.00 s | 9.34 s |
+
+Machine: MacBook Pro (MacBookPro18,3), Apple M1 Pro, 16 GB, macOS 27.2, APFS, PHP 8.5.12, Composer 2.11.1, romposer built with `cargo build --release` (rustc 1.99.1), over a home connection. On this machine the store costs time rather than saving it, for pcomposer and romposer alike: cold runs, which fill it, take about 4x longer, and warm runs from it are slower than unzipping from Composer's cache. Its gain here is disk space shared across projects, not speed. Not profiled yet. Installer fixtures: 197/228 (the `Installer fixtures pass rate` step of CI).
 
 ## Install
 
 ```sh
 cargo install --git https://github.com/jdecool/romposer
 ```
+
+Or download a binary (macOS arm64/x86_64, Linux x86_64/arm64) from the GitHub Releases page; each `v*` tag builds them.
 
 macOS and Linux only.
 
