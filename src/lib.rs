@@ -14,6 +14,7 @@ pub mod io;
 pub mod json;
 pub mod lock;
 pub mod package;
+pub mod platform;
 pub mod schema;
 pub mod semver;
 pub mod spdx;
@@ -23,3 +24,7 @@ pub mod validation;
 
 /// Composer version whose observable behaviour romposer reproduces.
 pub const COMPOSER_VERSION: &str = "2.11.1";
+/// `PluginInterface::PLUGIN_API_VERSION`
+pub const PLUGIN_API_VERSION: &str = "2.11.0";
+/// `Composer::RUNTIME_API_VERSION`
+pub const RUNTIME_API_VERSION: &str = "2.2.2";

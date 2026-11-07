@@ -49,6 +49,9 @@ enum Command {
     /// Dumps the autoloader.
     #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
     DumpAutoload(commands::dump_autoload::Args),
+    /// Check that platform requirements are satisfied.
+    #[command(name = "check-platform-reqs")]
+    CheckPlatformReqs(commands::check_platform_reqs::Args),
     /// Inspect and maintain the shared package store
     #[command(subcommand)]
     Store(commands::store::Command),
@@ -76,6 +79,9 @@ pub fn run() -> i32 {
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
         Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
+        Some(Command::CheckPlatformReqs(args)) => {
+            commands::check_platform_reqs::run(&args, &mut io)
+        }
         None => {
             println!("{VERSION_LINE}");
             0
