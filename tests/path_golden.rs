@@ -248,11 +248,13 @@ fn monorepo_with_path_artifact_and_archive_dists_matches_composer() {
         }
         if tool == "romposer" {
             assert_eq!(read(&dir, "vendor/composer/pcomposer.json"), "{}\n");
-            let store = home.join("cache/pcomposer-store/packages");
-            assert!(
-                !store.exists() || std::fs::read_dir(&store).unwrap().next().is_none(),
-                "nothing may be ingested into the store"
-            );
+            for sub in ["index", "files"] {
+                let store = home.join("cache/pcomposer-store").join(sub);
+                assert!(
+                    !store.exists() || std::fs::read_dir(&store).unwrap().next().is_none(),
+                    "nothing may be ingested into the store ({sub})"
+                );
+            }
         }
         results.push((outputs, snapshots));
     }
