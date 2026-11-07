@@ -43,6 +43,9 @@ pub struct Cli {
 enum Command {
     /// Validates a composer.json and composer.lock
     Validate(commands::validate::Args),
+    /// Installs the project dependencies from the composer.lock file if present, or falls back on the composer.json.
+    #[command(visible_alias = "i")]
+    Install(commands::install::Args),
 }
 
 /// Runs the CLI and returns the process exit code.
@@ -64,6 +67,7 @@ pub fn run() -> i32 {
     };
     match cli.command {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
+        Some(Command::Install(args)) => commands::install::run(&args, &mut io),
         None => {
             println!("{VERSION_LINE}");
             0

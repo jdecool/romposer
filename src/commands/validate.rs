@@ -83,7 +83,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     }
     let manifest_obj = manifest.as_object().cloned().unwrap_or_default();
     let root = load_root(&manifest_obj)?;
-    let config = Config::load(Some(&root.config));
+    let config = Config::for_project(&crate::fs::cwd(), &manifest_obj, path)?;
     let check_lock = (!args.no_check_lock && config.bool("lock")) || args.check_lock;
 
     let mut lock_errors = Vec::new();

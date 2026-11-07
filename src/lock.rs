@@ -7,6 +7,10 @@ use crate::package::{self, Package};
 use crate::semver::Constraint;
 use std::path::Path;
 
+/// `JsonFile::CONFLICTED_CONTENT_HASH`
+pub const CONFLICTED_CONTENT_HASH: &str =
+    "VCS merge conflict detected. Please run `composer update --lock`.";
+
 /// `Locker::getContentHash`: md5 of the relevant keys, as PHP would re-encode them.
 pub fn content_hash(composer_json: &str) -> Result<String, String> {
     const RELEVANT: [&str; 11] = [

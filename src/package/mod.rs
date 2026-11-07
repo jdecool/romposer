@@ -1,5 +1,6 @@
 //! Package model and the port of `ArrayLoader` (array → package).
 
+pub mod dumper;
 pub mod root;
 
 use crate::semver::{self, Constraint};
@@ -98,6 +99,7 @@ pub struct Package {
     pub include_paths: Vec<String>,
     pub php_ext: Option<Value>,
     pub release_date: Option<String>,
+    pub published_date: Option<String>,
     pub notification_url: Option<String>,
     pub description: Option<String>,
     pub homepage: Option<String>,
@@ -141,6 +143,7 @@ impl Package {
             include_paths: vec![],
             php_ext: None,
             release_date: None,
+            published_date: None,
             notification_url: None,
             description: None,
             homepage: None,
@@ -164,6 +167,62 @@ impl Package {
 
     pub fn stability(&self) -> semver::Stability {
         semver::parse_stability(&self.version)
+    }
+
+    /// `BasePackage::getFullPrettyVersion` in its default display mode.
+    pub fn full_pretty_version(&self) -> String {
+        let source_type = self.source.as_ref().map(|s| s.kind.as_str()).unwrap_or("");
+        let dist_ref = self
+            .dist
+            .as_ref()
+            .and_then(|d| d.reference.as_deref())
+            .unwrap_or("");
+        if !self.is_dev()
+            || (!matches!(source_type, "hg" | "git")
+                && (!source_type.is_empty() || dist_ref.is_empty()))
+        {
+            return self.pretty_version.clone();
+        }
+        let source_ref = self
+            .source
+            .as_ref()
+            .and_then(|s| s.reference.as_deref())
+            .unwrap_or("");
+        let reference = if !source_ref.is_empty() {
+            source_ref
+        } else {
+            dist_ref
+        };
+        if reference.is_empty() {
+            return self.pretty_version.clone();
+        }
+        let short = if reference.len() == 40 {
+            &reference[..7]
+        } else {
+            reference
+        };
+        format!("{} {}", self.pretty_version, short)
+    }
+
+    /// `CompletePackage::isAbandoned`
+    pub fn is_abandoned(&self) -> bool {
+        !matches!(
+            self.abandoned,
+            None | Some(Value::Bool(false)) | Some(Value::Null)
+        )
+    }
+
+    /// `CompletePackage::getReplacementPackage`
+    pub fn replacement_package(&self) -> Option<String> {
+        match &self.abandoned {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// `Package::__toString`: `name-version`
+    pub fn unique_name(&self) -> String {
+        format!("{}-{}", self.name, self.version)
     }
 
     pub fn links(&self, kind: LinkType) -> &[Link] {
@@ -466,6 +525,11 @@ fn configure(package: &mut Package, config: &Map<String, Value>) -> Result<(), S
     }
     package.php_ext = config.get("php-ext").cloned();
     package.release_date = match config.get("time") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    package.published_date = match config.get("published-time") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
