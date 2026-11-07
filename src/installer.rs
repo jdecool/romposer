@@ -165,25 +165,95 @@ pub fn install_path(vendor_dir: &str, package: &Package) -> Option<String> {
     })
 }
 
-fn unsupported(package: &Package) -> Option<String> {
-    let dist_type = package.dist.as_ref().map(|d| d.kind.as_str());
+fn unsupported(package: &Package, source: &str) -> Option<String> {
     if package.kind == "metapackage" {
         return Some(format!(
-            "{}: metapackages are not yet supported",
+            "{}: metapackages are not yet supported (romposer slice 1 installs zip dists only)",
             package.pretty_name
         ));
     }
-    match dist_type {
-        Some("zip") => None,
-        Some(other) => Some(format!(
-            "{}: dist type \"{other}\" is not yet supported",
-            package.pretty_name
-        )),
-        None => Some(format!(
-            "{}: source-only packages are not yet supported",
+    if source == "source" {
+        let kind = package.source.as_ref().map_or("", |s| s.kind.as_str());
+        return (kind != "git").then(|| {
+            format!(
+                "{}: {kind} sources are not supported by romposer, only git ones are",
+                package.pretty_name
+            )
+        });
+    }
+    match package.dist.as_ref().map_or("", |d| d.kind.as_str()) {
+        "zip" => None,
+        other => Some(format!(
+            "{}: dist type \"{other}\" is not yet supported (romposer slice 1 installs zip dists only)",
             package.pretty_name
         )),
     }
+}
+
+/// `--prefer-source` / `--prefer-dist` when given, else `preferred-install` (Composer's
+/// `getPreferredInstallOptions`).
+fn preferred_install(config: &Config, options: &Options) -> (bool, bool) {
+    if options.prefer_source || options.prefer_dist {
+        return (options.prefer_source, options.prefer_dist);
+    }
+    match config.get("preferred-install").and_then(Value::as_str) {
+        Some("source") => (true, false),
+        Some("dist") => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// `DownloadManager::getAvailableSources`, first choice: `source` or `dist`.
+fn install_source(
+    config: &Config,
+    prefer: (bool, bool),
+    package: &Package,
+    prev: Option<&Package>,
+) -> Result<&'static str, String> {
+    let mut sources = Vec::new();
+    if package.source.as_ref().is_some_and(|s| !s.kind.is_empty()) {
+        sources.push("source");
+    }
+    if package.dist.as_ref().is_some_and(|d| !d.kind.is_empty()) {
+        sources.push("dist");
+    }
+    if sources.is_empty() {
+        return Err(format!(
+            "Package {}-{} must have a source or dist specified",
+            package.name, package.pretty_version
+        ));
+    }
+    if let Some(prev) = prev
+        && let Some(prev_source) = sources
+            .iter()
+            .find(|s| prev.installation_source.as_deref() == Some(**s))
+        && !(!prev.is_dev() && *prev_source == "dist" && package.is_dev())
+    {
+        return Ok(prev_source);
+    }
+    let (prefer_source, prefer_dist) = prefer;
+    if !prefer_source && (prefer_dist || package_preference(config, package) == "dist") {
+        sources.reverse();
+    }
+    Ok(sources[0])
+}
+
+/// `DownloadManager::resolvePackageInstallPreference`
+fn package_preference(config: &Config, package: &Package) -> &'static str {
+    if let Some(Value::Object(prefs)) = config.get("preferred-install") {
+        for (pattern, preference) in prefs {
+            let re = format!("(?i)^{}$", regex::escape(pattern).replace(r"\*", ".*"));
+            if Regex::new(&re).is_ok_and(|r| r.is_match(&package.name)) {
+                let preference = preference.as_str().unwrap_or("");
+                return if preference == "dist" || (!package.is_dev() && preference == "auto") {
+                    "dist"
+                } else {
+                    "source"
+                };
+            }
+        }
+    }
+    if package.is_dev() { "source" } else { "dist" }
 }
 
 /// The store side of a run: configuration, store, manifest and the one-per-run fallback warning.
@@ -1245,15 +1315,26 @@ impl FilesystemRun<'_> {
         operations: &[Operation],
         vendor_dir: &str,
     ) -> Result<(), String> {
+        // installation source (`source` or `dist`) of every package to install
+        let prefer = preferred_install(self.config, self.options);
+        let mut sources: HashMap<String, &'static str> = HashMap::new();
         for op in operations {
-            if let Operation::Install(p) | Operation::Update { target: p, .. } = op
-                && let Some(reason) = unsupported(p)
-            {
-                return Err(format!(
-                    "{reason} (romposer slice 1 installs zip dists only)"
-                ));
+            let (p, prev) = match op {
+                Operation::Install(p) => (p, None),
+                Operation::Update { initial, target } => (target, Some(initial)),
+                _ => continue,
+            };
+            let source = if p.kind == "metapackage" {
+                "dist"
+            } else {
+                install_source(self.config, prefer, p, prev)?
+            };
+            if let Some(reason) = unsupported(p, source) {
+                return Err(reason);
             }
+            sources.insert(p.unique_name(), source);
         }
+        let from_source = |p: &Package| sources.get(&p.unique_name()) == Some(&"source");
 
         ensure_dir(Path::new(vendor_dir))?;
         let vendor_dir = realpath(Path::new(vendor_dir));
@@ -1271,14 +1352,24 @@ impl FilesystemRun<'_> {
                 _ => None,
             })
             .collect();
+        // ponytail: git mirrors sync before the dist downloads start, so a mixed run lists
+        // its "Syncing" lines first where Composer interleaves them in operation order
+        let mut cached: HashMap<String, bool> = HashMap::new();
+        for p in to_install.iter().filter(|p| from_source(p)) {
+            cached.insert(
+                p.unique_name(),
+                crate::git::download(self.io, self.config, p)?,
+            );
+        }
         let to_download: Vec<&Package> = to_install
             .iter()
             .copied()
             .filter(|p| {
-                !goes_through_store(&store_run, &vendor_dir, p)
-                    || !store_run
-                        .as_ref()
-                        .is_some_and(|run| run.store.has(&Store::key(p)))
+                !from_source(p)
+                    && (!goes_through_store(&store_run, &vendor_dir, p)
+                        || !store_run
+                            .as_ref()
+                            .is_some_and(|run| run.store.has(&Store::key(p))))
             })
             .collect();
         let mut archives = downloader.download_all(self.io, &to_download)?;
@@ -1318,19 +1409,32 @@ impl FilesystemRun<'_> {
                     if !Path::new(&path).exists() && local_repo.has_package(package) {
                         binaries.remove_binaries(package)?;
                     }
-                    self.install_code(
-                        &mut store_run,
-                        &mut downloader,
-                        &mut archives,
-                        package,
-                        Path::new(&path),
-                        &vendor_dir,
-                        None,
-                    )?;
+                    let source = from_source(package);
+                    if source {
+                        crate::git::install(
+                            self.io,
+                            self.config,
+                            package,
+                            Path::new(&path),
+                            &label(package, None),
+                            cached[&package.unique_name()],
+                        )?;
+                    } else {
+                        self.install_code(
+                            &mut store_run,
+                            &mut downloader,
+                            &mut archives,
+                            package,
+                            Path::new(&path),
+                            &vendor_dir,
+                            None,
+                        )?;
+                    }
                     binaries.install_binaries(self.io, package, Path::new(&path), true)?;
                     if !local_repo.has_package(package) {
                         let mut installed = package.clone();
-                        installed.installation_source = Some("dist".into());
+                        installed.installation_source =
+                            Some(if source { "source" } else { "dist" }.into());
                         local_repo.add_package(installed);
                     }
                     downloader.cleanup(package, Path::new(&path));
@@ -1338,22 +1442,61 @@ impl FilesystemRun<'_> {
                 Operation::Update { initial, target } => {
                     let initial_path = install_path(&vendor_dir, initial).unwrap();
                     let target_path = install_path(&vendor_dir, target).unwrap();
+                    let source = from_source(target);
+                    let was_source = initial.installation_source.as_deref() == Some("source");
+                    // a source checkout is only replaced once its local changes are dealt with
+                    let forced = if was_source {
+                        crate::git::clean_changes(self.config, Path::new(&initial_path), source)?
+                    } else {
+                        false
+                    };
                     binaries.remove_binaries(initial)?;
-                    remove(Path::new(&initial_path))?;
-                    self.install_code(
-                        &mut store_run,
-                        &mut downloader,
-                        &mut archives,
-                        target,
-                        Path::new(&target_path),
-                        &vendor_dir,
-                        Some(initial),
-                    )?;
+                    let target_label = label(target, Some(initial));
+                    if source && was_source && initial_path == target_path {
+                        crate::git::update(
+                            self.io,
+                            self.config,
+                            target,
+                            Path::new(&target_path),
+                            &target_label,
+                            cached[&target.unique_name()],
+                            forced,
+                        )?;
+                        crate::git::reapply_changes(
+                            self.io,
+                            self.config,
+                            Path::new(&target_path),
+                            forced,
+                        )?;
+                    } else {
+                        remove(Path::new(&initial_path))?;
+                        if source {
+                            crate::git::install(
+                                self.io,
+                                self.config,
+                                target,
+                                Path::new(&target_path),
+                                &target_label,
+                                cached[&target.unique_name()],
+                            )?;
+                        } else {
+                            self.install_code(
+                                &mut store_run,
+                                &mut downloader,
+                                &mut archives,
+                                target,
+                                Path::new(&target_path),
+                                &vendor_dir,
+                                Some(initial),
+                            )?;
+                        }
+                    }
                     binaries.install_binaries(self.io, target, Path::new(&target_path), true)?;
                     local_repo.remove_package(initial);
                     if !local_repo.has_package(target) {
                         let mut installed = target.clone();
-                        installed.installation_source = Some("dist".into());
+                        installed.installation_source =
+                            Some(if source { "source" } else { "dist" }.into());
                         local_repo.add_package(installed);
                     }
                     downloader.cleanup(target, Path::new(&target_path));
@@ -1365,6 +1508,9 @@ impl FilesystemRun<'_> {
                         package.full_pretty_version()
                     ));
                     if let Some(path) = install_path(&vendor_dir, package) {
+                        if package.installation_source.as_deref() == Some("source") {
+                            crate::git::clean_changes(self.config, Path::new(&path), false)?;
+                        }
                         remove(Path::new(&path))?;
                         binaries.remove_binaries(package)?;
                         if let Some(parent) = Path::new(&path).parent()
@@ -1430,26 +1576,7 @@ impl FilesystemRun<'_> {
         vendor_dir: &str,
         initial: Option<&Package>,
     ) -> Result<(), String> {
-        let label = match initial {
-            Some(i) => {
-                let action = if crate::semver::is_upgrade(&i.version, &package.version) {
-                    "Upgrading"
-                } else {
-                    "Downgrading"
-                };
-                format!(
-                    "{action} {} ({} => {})",
-                    i.pretty_name,
-                    i.full_pretty_version(),
-                    package.full_pretty_version()
-                )
-            }
-            None => format!(
-                "Installing {} ({})",
-                package.pretty_name,
-                package.full_pretty_version()
-            ),
-        };
+        let label = label(package, initial);
         if !goes_through_store(store_run, vendor_dir, package) {
             self.io.error(&format!("  - {label}: Extracting archive"));
             let archive = archives
@@ -1505,6 +1632,30 @@ impl FilesystemRun<'_> {
         }
         run.manifest.record(package, used.as_str());
         Ok(())
+    }
+}
+
+/// `InstallOperation::format` / `UpdateOperation::format`
+fn label(package: &Package, initial: Option<&Package>) -> String {
+    match initial {
+        Some(i) => {
+            let action = if crate::semver::is_upgrade(&i.version, &package.version) {
+                "Upgrading"
+            } else {
+                "Downgrading"
+            };
+            format!(
+                "{action} {} ({} => {})",
+                i.pretty_name,
+                i.full_pretty_version(),
+                package.full_pretty_version()
+            )
+        }
+        None => format!(
+            "Installing {} ({})",
+            package.pretty_name,
+            package.full_pretty_version()
+        ),
     }
 }
 

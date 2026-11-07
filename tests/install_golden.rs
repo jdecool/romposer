@@ -194,11 +194,13 @@ fn unsupported_dists_fail_cleanly() {
     .unwrap();
     fs::write(
         dir.join("composer.lock"),
-        r#"{"content-hash":"x","packages":[{"name":"c/d","version":"1.0.0","source":{"type":"git","url":"https://example.com/c/d.git","reference":"abc"}}],"packages-dev":[],"aliases":[],"minimum-stability":"stable","stability-flags":{},"prefer-stable":false,"prefer-lowest":false,"platform":{},"platform-dev":{},"plugin-api-version":"2.11.0"}"#,
+        r#"{"content-hash":"x","packages":[{"name":"c/d","version":"1.0.0","source":{"type":"hg","url":"https://example.com/c/d","reference":"abc"}}],"packages-dev":[],"aliases":[],"minimum-stability":"stable","stability-flags":{},"prefer-stable":false,"prefer-lowest":false,"platform":{},"platform-dev":{},"plugin-api-version":"2.11.0"}"#,
     )
     .unwrap();
     let out = run(&romposer(), &dir, &["install"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet supported"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hg sources are not supported by romposer")
+    );
     assert!(!dir.join("vendor/c").exists());
 }

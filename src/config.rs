@@ -31,7 +31,7 @@ pub fn lock_file(composer_file: &Path) -> PathBuf {
     }
 }
 
-fn env(name: &str) -> Option<String> {
+pub fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 

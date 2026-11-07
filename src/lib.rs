@@ -9,6 +9,7 @@ pub mod config;
 pub mod download;
 pub mod fixtures;
 pub mod fs;
+pub mod git;
 pub mod installed;
 pub mod installer;
 pub mod io;
@@ -25,6 +26,7 @@ pub mod spdx;
 pub mod store;
 pub mod transaction;
 pub mod validation;
+pub mod vcs;
 pub mod version_selector;
 pub mod zend_sort;
 

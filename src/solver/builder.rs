@@ -63,10 +63,17 @@ impl Repository<'_> {
                 repo.packages.len(),
                 if repo.packages.len() > 1 { "s" } else { "" }
             ),
-            Repository::Composer(repo) => format!(
-                "composer repo ({})",
-                crate::download::sanitize_url(&repo.url)
-            ),
+            Repository::Composer(repo) => match &repo.vcs {
+                Some(vcs) => format!(
+                    "vcs repo ({} {})",
+                    vcs.driver.unwrap_or("vcs"),
+                    crate::download::sanitize_url(&repo.url)
+                ),
+                None => format!(
+                    "composer repo ({})",
+                    crate::download::sanitize_url(&repo.url)
+                ),
+            },
         }
     }
 

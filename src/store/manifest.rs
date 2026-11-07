@@ -73,8 +73,10 @@ impl Manifest {
 
     /// Merges this run's records over the file and drops packages no longer installed at the recorded version.
     pub fn write(&self, installed: &[Package]) -> Result<(), String> {
+        // source checkouts never come from the store
         let versions: BTreeMap<&str, &str> = installed
             .iter()
+            .filter(|p| p.installation_source.as_deref() != Some("source"))
             .map(|p| (p.name.as_str(), p.pretty_version.as_str()))
             .collect();
         let mut entries = self.read();

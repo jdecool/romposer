@@ -282,6 +282,15 @@ pub struct ComposerRepository {
     degraded: bool,
     not_found: HashSet<String>,
     fresh: HashSet<String>,
+    /// a `vcs`/`git`/`github`/... repository, scanned on first use
+    pub vcs: Option<Vcs>,
+}
+
+/// A `VcsRepository`: its configuration, and the driver once the scan picked it.
+pub struct Vcs {
+    repo: Map<String, Value>,
+    config: Config,
+    pub driver: Option<&'static str>,
 }
 
 static SCHEME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w.]+\??://").unwrap());
@@ -293,14 +302,32 @@ pub fn from_config(config: &Config, http: Rc<Http>) -> Result<Vec<ComposerReposi
     for (name, value) in &config.repositories {
         let Value::Object(repo) = value else { continue };
         let kind = repo.get("type").and_then(Value::as_str).unwrap_or("");
-        // ponytail: vcs/path/package repositories arrive with tickets 16/17
-        if kind != "composer" {
+        if crate::vcs::UNSUPPORTED.contains(&kind) || kind == "forgejo" {
+            return Err(crate::vcs::unsupported(kind));
+        }
+        let vcs = matches!(
+            kind,
+            "vcs" | "git" | "github" | "gitlab" | "bitbucket" | "git-bitbucket"
+        );
+        // ponytail: path/artifact repositories arrive with ticket 17
+        if kind != "composer" && !vcs {
             continue;
         }
         let url = repo
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("Repository \"{name}\" ({kind}) must have a url"))?;
+        if vcs {
+            let mut r = ComposerRepository::new(name, "file:///", repo, config, http.clone())?;
+            r.url = crate::config::expand_path(url);
+            r.vcs = Some(Vcs {
+                repo: repo.clone(),
+                config: config.clone(),
+                driver: None,
+            });
+            repos.push(r);
+            continue;
+        }
         repos.push(ComposerRepository::new(
             name,
             url,
@@ -384,6 +411,7 @@ impl ComposerRepository {
             degraded: false,
             not_found: HashSet::new(),
             fresh: HashSet::new(),
+            vcs: None,
         })
     }
 
@@ -583,6 +611,21 @@ impl ComposerRepository {
     }
 
     fn build_root(&mut self, io: &mut Io, max_age: Option<u64>) -> Result<RootData, String> {
+        if let Some(vcs) = &mut self.vcs {
+            let scan = crate::vcs::scan(io, &vcs.config, &self.http, &vcs.repo)?;
+            vcs.driver = Some(scan.driver);
+            return Ok(RootData {
+                metadata_url: None,
+                search_url: None,
+                list_url: None,
+                notify_url: None,
+                available: None,
+                patterns: vec![],
+                dist_mirrors: vec![],
+                inline: scan.packages,
+                advisories: None,
+            });
+        }
         let mut data: Option<Map<String, Value>> = None;
         if let Some(cached) = self.cache_read("packages.json")
             && let Ok(Value::Object(cached)) = serde_json::from_str::<Value>(&cached)
@@ -899,6 +942,9 @@ impl ComposerRepository {
 
     /// `hasSecurityAdvisories`
     pub fn has_security_advisories(&mut self, io: &mut Io) -> Result<bool, String> {
+        if self.vcs.is_some() {
+            return Ok(false);
+        }
         let root = self.load_root(io, Some(600))?;
         Ok(root
             .advisories
@@ -915,6 +961,9 @@ impl ComposerRepository {
         constraints: &BTreeMap<String, Constraint>,
         allow_partial: bool,
     ) -> Result<BTreeMap<String, Vec<Advisory>>, String> {
+        if self.vcs.is_some() {
+            return Ok(BTreeMap::new());
+        }
         self.load_root(io, Some(600))?;
         let Some((metadata, api_url)) = self.root.as_ref().unwrap().advisories.clone() else {
             return Ok(BTreeMap::new());
@@ -1009,50 +1058,18 @@ impl ComposerRepository {
         let mut found: Vec<String> = Vec::new();
         if root.metadata_url.is_none() {
             // ArrayRepository::loadPackages over the inline packages
-            let inline = root.inline.clone();
-            for data in inline {
-                let name = data
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                let Some((_, constraint)) = names.iter().find(|(n, _)| *n == name) else {
-                    continue;
-                };
-                if !self.is_allowed(&name) {
-                    continue;
-                }
-                if !found.contains(&name) {
-                    found.push(name.clone());
-                }
-                let mut data = data;
-                normalize_version(&mut data)?;
-                let version = data
-                    .get("version_normalized")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if already_loaded
-                    .get(&name)
-                    .is_some_and(|v| v.contains(&version))
-                {
-                    continue;
-                }
-                let package = self.create_package(data)?;
-                if constraint
-                    .as_ref()
-                    .is_none_or(|c| c.matches(&Constraint::new("==", &package.version)))
-                    && crate::solver::is_package_acceptable(
-                        acceptable,
-                        flags,
-                        &crate::solver::names(&package, true),
-                        package.stability(),
-                    )
-                {
-                    push_with_alias_of(&mut packages, package);
-                }
-            }
-            return Ok((found, packages));
+            let all = self.all_packages(io)?;
+            let names: Vec<(String, Option<Constraint>)> = names
+                .iter()
+                .map(|(n, c)| (n.to_lowercase(), c.clone()))
+                .collect();
+            return Ok(crate::solver::builder::array_load_packages(
+                &all,
+                &names,
+                acceptable,
+                flags,
+                already_loaded,
+            ));
         }
         let only_dev = acceptable == [Stability::Dev] && flags.is_empty();
         let mut jobs: Vec<(String, String, Option<Constraint>)> = Vec::new();

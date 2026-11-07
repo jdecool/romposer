@@ -844,6 +844,8 @@ pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub last_modified: Option<String>,
+    /// the `link` header (API pagination)
+    pub link: Option<String>,
 }
 
 /// `reqwest::Client` with Composer's user agent and manual redirects.
@@ -947,6 +949,11 @@ pub async fn http_request(
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let link = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let bytes = response.bytes().await.map_err(|e| {
             (
                 None,
@@ -961,6 +968,7 @@ pub async fn http_request(
             status: status.as_u16(),
             body: bytes.to_vec(),
             last_modified,
+            link,
         });
     }
     Err((
