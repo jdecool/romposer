@@ -46,6 +46,9 @@ enum Command {
     /// Installs the project dependencies from the composer.lock file if present, or falls back on the composer.json.
     #[command(visible_alias = "i")]
     Install(commands::install::Args),
+    /// Dumps the autoloader.
+    #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
+    DumpAutoload(commands::dump_autoload::Args),
 }
 
 /// Runs the CLI and returns the process exit code.
@@ -68,6 +71,7 @@ pub fn run() -> i32 {
     match cli.command {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
+        Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
         None => {
             println!("{VERSION_LINE}");
             0

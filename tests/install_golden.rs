@@ -91,11 +91,32 @@ fn install_from_lock_matches_composer() {
     );
 
     assert_eq!(listing(&theirs), listing(&ours), "vendor/ listing differs");
-    assert_eq!(
-        fs::read_to_string(theirs.join("vendor/composer/installed.json")).unwrap(),
-        fs::read_to_string(ours.join("vendor/composer/installed.json")).unwrap(),
-        "installed.json differs"
-    );
+    assert_generated_files_equal(&theirs, &ours, "install");
+
+    // optimized and authoritative dumps
+    for flags in [
+        &["-o"][..],
+        &["-a"][..],
+        &["--apcu", "--apcu-prefix=romposer"][..],
+    ] {
+        let mut t_args = vec!["dump-autoload", "--no-ansi"];
+        t_args.extend_from_slice(flags);
+        let out = run(&composer, &theirs, &t_args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut o_args = vec!["dump-autoload"];
+        o_args.extend_from_slice(flags);
+        let out = run(&romposer(), &ours, &o_args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_generated_files_equal(&theirs, &ours, &format!("dump-autoload {flags:?}"));
+    }
     assert_eq!(
         fs::read_to_string(theirs.join("vendor/bin/php-parse")).unwrap(),
         fs::read_to_string(ours.join("vendor/bin/php-parse")).unwrap(),
@@ -130,11 +151,30 @@ fn install_from_lock_matches_composer() {
         listing(&ours),
         "vendor/ listing differs after --no-dev"
     );
-    assert_eq!(
-        fs::read_to_string(theirs.join("vendor/composer/installed.json")).unwrap(),
-        fs::read_to_string(ours.join("vendor/composer/installed.json")).unwrap(),
-        "installed.json differs after --no-dev"
-    );
+    assert_generated_files_equal(&theirs, &ours, "install --no-dev");
+}
+
+/// vendor/autoload.php and every file under vendor/composer/ must be byte-identical.
+fn assert_generated_files_equal(theirs: &Path, ours: &Path, step: &str) {
+    let mut files = vec!["vendor/autoload.php".to_string()];
+    for entry in fs::read_dir(theirs.join("vendor/composer"))
+        .unwrap()
+        .flatten()
+    {
+        files.push(format!(
+            "vendor/composer/{}",
+            entry.file_name().to_string_lossy()
+        ));
+    }
+    for file in files {
+        let t = fs::read_to_string(theirs.join(&file)).unwrap();
+        let o = fs::read_to_string(ours.join(&file))
+            .unwrap_or_else(|_| panic!("{step}: romposer did not write {file}"));
+        assert!(
+            t == o,
+            "{step}: {file} differs\n--- composer\n{t}\n--- romposer\n{o}"
+        );
+    }
 }
 
 #[test]

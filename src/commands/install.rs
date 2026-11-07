@@ -182,6 +182,10 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             apcu_autoloader_prefix: args.apcu_autoloader_prefix.clone(),
             run_scripts: !args.no_scripts,
             verbose: args.dry_run,
+            strict_psr_autoloader: args.strict_psr_autoloader
+                || config.bool("strict-psr-autoloader"),
+            ignore_all_platform_reqs: args.ignore_platform_reqs,
+            ignored_platform_reqs: args.ignore_platform_req.clone(),
         },
     };
     installer.run()

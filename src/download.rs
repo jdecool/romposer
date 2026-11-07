@@ -733,23 +733,34 @@ pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
         };
         let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(perm));
     }
-    for (out, link) in symlinks {
-        let resolved = normalize_path(&format!(
-            "{}/{link}",
-            out.parent().unwrap_or(target).to_string_lossy()
-        ));
-        let root = normalize_path(&target.to_string_lossy());
-        if Path::new(&link).is_absolute()
-            || !(resolved == root || resolved.starts_with(&format!("{root}/")))
-        {
+    // links are only ever relative and downward: no absolute target, no ".." component,
+    // and once created each one must still resolve inside the extraction root
+    let root = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+    for (out, link) in &symlinks {
+        let escapes = Path::new(link).is_absolute()
+            || Path::new(link)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if escapes {
             return Err(format!(
                 "Failed to extract {}: symlink {} points outside of the package ({link})",
                 archive.display(),
                 out.display()
             ));
         }
-        let _ = std::fs::remove_file(&out);
-        std::os::unix::fs::symlink(&link, &out).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(out);
+        std::os::unix::fs::symlink(link, out).map_err(|e| e.to_string())?;
+    }
+    for (out, link) in &symlinks {
+        let inside = std::fs::canonicalize(out).is_ok_and(|p| p.starts_with(&root));
+        if !inside {
+            let _ = std::fs::remove_file(out);
+            return Err(format!(
+                "Failed to extract {}: symlink {} points outside of the package ({link})",
+                archive.display(),
+                out.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -856,7 +867,11 @@ async fn fetch_once(
         let response = request.send().await.map_err(|e| {
             (
                 None,
-                format!("curl error while downloading {}: {e}", sanitize_url(&url)),
+                format!(
+                    "curl error while downloading {}: {}",
+                    sanitize_url(&url),
+                    e.without_url()
+                ),
             )
         })?;
         let status = response.status();
@@ -889,7 +904,11 @@ async fn fetch_once(
         let bytes = response.bytes().await.map_err(|e| {
             (
                 None,
-                format!("curl error while downloading {}: {e}", sanitize_url(&url)),
+                format!(
+                    "curl error while downloading {}: {}",
+                    sanitize_url(&url),
+                    e.without_url()
+                ),
             )
         })?;
         std::fs::write(file_name, &bytes).map_err(|e| (None, format!("{} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", sanitize_url(&url), file_name.display())))?;

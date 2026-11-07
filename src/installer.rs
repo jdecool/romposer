@@ -36,6 +36,9 @@ pub struct Options {
     pub apcu_autoloader_prefix: Option<String>,
     pub run_scripts: bool,
     pub verbose: bool,
+    pub strict_psr_autoloader: bool,
+    pub ignore_all_platform_reqs: bool,
+    pub ignored_platform_reqs: Vec<String>,
 }
 
 pub struct Installer<'a> {
@@ -113,17 +116,28 @@ impl Installer<'_> {
             } else {
                 self.io.error("Generating autoload files");
             }
-            crate::autoload::dump(
+            let options = crate::autoload::DumpOptions {
+                optimize: self.options.optimize_autoloader || self.options.classmap_authoritative,
+                authoritative: self.options.classmap_authoritative,
+                apcu: self.options.apcu_autoloader,
+                apcu_prefix: self.options.apcu_autoloader_prefix.clone(),
+                dev_mode: Some(self.options.dev_mode),
+                dry_run: false,
+                strict_ambiguous: false,
+                ignore_all_platform_reqs: self.options.ignore_all_platform_reqs,
+                ignored_platform_reqs: self.options.ignored_platform_reqs.clone(),
+            };
+            let class_map = crate::autoload::dump(
                 self.io,
                 self.config,
                 &local_repo,
                 self.root,
-                self.options.optimize_autoloader || self.options.classmap_authoritative,
-                self.options.classmap_authoritative,
-                self.options.apcu_autoloader,
-                self.options.apcu_autoloader_prefix.as_deref(),
-                self.options.dev_mode,
+                Some(self.lock),
+                &options,
             )?;
+            if self.options.strict_psr_autoloader && !class_map.psr_violations().is_empty() {
+                return Ok(ERROR_PSR_AUTOLOAD_VIOLATION);
+            }
         }
 
         if !self.options.dry_run && !self.options.download_only {
@@ -272,6 +286,22 @@ impl Installer<'_> {
         Ok(0)
     }
 
+    /// `InstalledRepository::write` with `$dumpVersions`: installed.json, installed.php, InstalledVersions.php.
+    fn write_local_repo(
+        &self,
+        local_repo: &InstalledRepository,
+        vendor_dir: &str,
+    ) -> Result<(), String> {
+        local_repo.write(self.options.dev_mode, |p| install_path(vendor_dir, p))?;
+        crate::autoload::write_installed_versions(
+            &format!("{vendor_dir}/composer"),
+            local_repo,
+            self.root,
+            self.options.dev_mode,
+            |p| install_path(vendor_dir, p),
+        )
+    }
+
     /// `InstallationManager::execute`
     fn execute(
         &mut self,
@@ -395,11 +425,10 @@ impl Installer<'_> {
                 }
                 Operation::MarkAliasUninstalled(package) => local_repo.remove_package(package),
             }
-            let dev = self.options.dev_mode;
-            local_repo.write(dev, |p| install_path(&vendor_dir, p))?;
+            self.write_local_repo(local_repo, &vendor_dir)?;
         }
         // do a last write so that we write the repository even if nothing changed
-        local_repo.write(self.options.dev_mode, |p| install_path(&vendor_dir, p))?;
+        self.write_local_repo(local_repo, &vendor_dir)?;
         Ok(())
     }
 }

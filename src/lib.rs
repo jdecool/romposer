@@ -2,6 +2,7 @@
 
 pub mod autoload;
 pub mod binaries;
+pub mod classmap;
 pub mod cli;
 pub mod commands;
 pub mod config;
