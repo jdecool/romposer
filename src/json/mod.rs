@@ -5,6 +5,7 @@
 //! `serde_json` is only used for parsing (with `preserve_order`); every byte
 //! that ends up in a file goes through [`writer`].
 
+pub mod lint;
 pub mod writer;
 
 pub use serde_json::{Map, Value};
@@ -28,6 +29,7 @@ mod tests {
         m.insert("f".into(), Value::from(1e17));
         m.insert("g".into(), Value::from(10.0));
         m.insert("h".into(), Value::from(-0.0));
+        #[allow(clippy::approx_constant)]
         m.insert("i".into(), Value::from(3.14159265358979));
         m.insert("j".into(), Value::from(1e-5));
         m.insert("k".into(), Value::from(0.0001));
