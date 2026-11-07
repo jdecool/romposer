@@ -274,7 +274,10 @@ impl Manipulator {
             .find(|p| p.raw_key.replace("\\/", "/").to_lowercase() == lower);
         if let Some(existing) = existing {
             let key = encode_value(&Value::String(existing.raw_key.replace("\\/", "/")));
-            let replacement = format!("{key}: \"{constraint}\"");
+            let replacement = format!(
+                "{key}: {}",
+                encode_value(&Value::String(constraint.to_string()))
+            );
             links = format!(
                 "{}{}{}",
                 &links[..existing.key_start],

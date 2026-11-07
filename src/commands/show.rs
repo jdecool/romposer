@@ -12,9 +12,12 @@ use crate::io::Io;
 use crate::json::{Map, Value, encode};
 use crate::package::root::RootPackage;
 use crate::package::{LinkType, Package, is_platform_package};
-use crate::platform::{PhpInfo, PlatformRepository, overrides_from_config};
+use crate::platform::{PhpInfo, PlatformRepository, RequirementFilter, overrides_from_config};
 use crate::repository::{self, ComposerRepository, package_name_to_regexp};
-use crate::semver::{Constraint, version_compare, version_parser};
+use crate::semver::{Constraint, Stability, version_compare, version_parser};
+use crate::solver;
+use crate::solver::builder::{Repository, RepositorySet};
+use crate::version_selector::VersionSelector;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -22,43 +25,117 @@ use std::rc::Rc;
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// Package to inspect. Or a name including a wildcard (*) to filter lists of packages instead.
-    package: Option<String>,
+    pub package: Option<String>,
     /// Version or version constraint to inspect
     #[arg(value_name = "VERSION", id = "package_version")]
-    version: Option<String>,
+    pub version: Option<String>,
     /// List all packages
     #[arg(long)]
-    all: bool,
+    pub all: bool,
     /// List all locked packages
     #[arg(long)]
-    locked: bool,
+    pub locked: bool,
     /// List installed packages only (enabled by default, only present for BC).
     #[arg(short = 'i', long)]
-    installed: bool,
+    pub installed: bool,
     /// List platform packages only
     #[arg(short = 'p', long)]
-    platform: bool,
+    pub platform: bool,
     /// List available packages only
     #[arg(short = 'a', long)]
-    available: bool,
+    pub available: bool,
     /// Show the root package information
     #[arg(short = 's', long = "self")]
-    self_: bool,
+    pub self_: bool,
     /// List package names only
     #[arg(short = 'N', long)]
-    name_only: bool,
+    pub name_only: bool,
     /// Show package paths
     #[arg(short = 'P', long)]
-    path: bool,
+    pub path: bool,
     /// Format of the output: text or json
     #[arg(short = 'f', long, default_value = "text")]
-    format: String,
+    pub format: String,
     /// Disables search in require-dev packages.
     #[arg(long)]
-    no_dev: bool,
+    pub no_dev: bool,
     /// Shows only packages that are directly required by the root package
     #[arg(short = 'D', long)]
-    direct: bool,
+    pub direct: bool,
+    /// Show the latest version
+    #[arg(short = 'l', long)]
+    pub latest: bool,
+    /// Show the latest version but only for packages that are outdated
+    #[arg(short = 'o', long)]
+    pub outdated: bool,
+    /// Ignore specified package(s). Use it with the --outdated option if you don't want to be informed about new versions of some packages.
+    #[arg(long)]
+    pub ignore: Vec<String>,
+    /// Show only packages that have minor SemVer-compatible updates. Use with the --latest or --outdated option.
+    #[arg(short = 'm', long)]
+    pub minor_only: bool,
+    /// Show only packages that have patch SemVer-compatible updates. Use with the --latest or --outdated option.
+    #[arg(long)]
+    pub patch_only: bool,
+    /// Show only packages that have major SemVer-compatible updates. Use with the --latest or --outdated option.
+    #[arg(short = 'M', long)]
+    pub major_only: bool,
+    /// Displays the installed version's age, and sorts packages oldest first. Use with the --latest or --outdated option.
+    #[arg(short = 'A', long)]
+    pub sort_by_age: bool,
+    /// Return a non-zero exit code when there are outdated packages
+    #[arg(long)]
+    pub strict: bool,
+    /// List the dependencies as a tree
+    #[arg(short = 't', long)]
+    pub tree: bool,
+    /// Ignore a specific platform requirement (php & ext- packages). Use with the --outdated option
+    #[arg(long)]
+    pub ignore_platform_req: Vec<String>,
+    /// Ignore all platform requirements (php & ext- packages). Use with the --outdated option
+    #[arg(long)]
+    pub ignore_platform_reqs: bool,
+}
+
+impl Args {
+    /// Every option off, for the `outdated` alias.
+    pub fn for_outdated() -> Args {
+        Args {
+            package: None,
+            version: None,
+            all: false,
+            locked: false,
+            installed: false,
+            platform: false,
+            available: false,
+            self_: false,
+            name_only: false,
+            path: false,
+            format: "text".into(),
+            no_dev: false,
+            direct: false,
+            latest: false,
+            outdated: false,
+            ignore: vec![],
+            minor_only: false,
+            patch_only: false,
+            major_only: false,
+            sort_by_age: false,
+            strict: false,
+            tree: false,
+            ignore_platform_req: vec![],
+            ignore_platform_reqs: false,
+        }
+    }
+}
+
+/// `--latest` lookups: the remote repositories as one repository set.
+struct Latest<'a> {
+    set: RepositorySet<'a>,
+    platform: PlatformRepository,
+    minimum_stability: Stability,
+    flags: BTreeMap<String, u8>,
+    prefer_stable: bool,
 }
 
 pub fn run(args: &Args, io: &mut Io) -> i32 {
@@ -82,8 +159,16 @@ enum Entry {
     Pkg(Box<Package>),
 }
 
-/// (type, rows, name length, version length)
-type Section = (&'static str, Vec<Map<String, Value>>, usize, usize);
+struct Section {
+    kind: &'static str,
+    rows: Vec<Map<String, Value>>,
+    name_length: usize,
+    version_length: usize,
+    latest_length: usize,
+    release_date_length: usize,
+    write_latest: bool,
+    write_release_date: bool,
+}
 /// (matched package, pretty version => normalized version)
 type Found = (Option<Package>, Vec<(String, String)>);
 
@@ -100,10 +185,40 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     if args.installed && !args.self_ {
         io.warning("You are using the deprecated option \"installed\". Only installed packages are shown by default now. The --all option can be used to show all packages.");
     }
+    let mut args = Args { ..clone_args(args) };
+    if args.outdated {
+        args.latest = true;
+    } else if !args.ignore.is_empty() {
+        io.warning("You are using the option \"ignore\" for action other than \"outdated\", it will be ignored.");
+    }
     if args.direct && (args.all || args.available || args.platform) {
         io.error("The --direct (-D) option is not usable in combination with --all, --platform (-p) or --available (-a)");
         return Ok(1);
     }
+    if args.tree && (args.all || args.available) {
+        io.error(
+            "The --tree (-t) option is not usable in combination with --all or --available (-a)",
+        );
+        return Ok(1);
+    }
+    if [args.patch_only, args.minor_only, args.major_only]
+        .iter()
+        .filter(|b| **b)
+        .count()
+        > 1
+    {
+        io.error("Only one of --major-only, --minor-only or --patch-only can be used at once");
+        return Ok(1);
+    }
+    if args.tree && args.latest {
+        io.error("The --tree (-t) option is not usable in combination with --latest (-l)");
+        return Ok(1);
+    }
+    if args.tree && args.path {
+        io.error("The --tree (-t) option is not usable in combination with --path (-P)");
+        return Ok(1);
+    }
+    let args = &args;
     if args.format != "text" && args.format != "json" {
         io.error(&format!(
             "Unsupported format \"{}\". See help for supported formats.",
@@ -213,11 +328,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             packages.push(root.package.clone());
         }
         if args.no_dev {
-            packages.extend(filter_required_packages(
-                &local.packages,
-                &root.package,
-                &mut vec![],
-            ));
+            packages.extend(filter_required_packages(&local.packages, &root.package));
         } else {
             packages.extend(local.packages.iter().cloned());
         }
@@ -236,6 +347,37 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         ctx.root = Some(root);
     }
     let _ = locked_shown;
+    if args.latest && ctx.root.is_none() {
+        io.error("No composer.json found in the current directory, disabling \"latest\" option");
+    }
+    let show_latest = args.latest && ctx.root.is_some();
+    let filter_reqs =
+        RequirementFilter::from_options(args.ignore_platform_reqs, &args.ignore_platform_req);
+    // built once the repositories are no longer needed for listings (they move into the set)
+    let mut latest: Option<Latest> = None;
+    let latest_platform = PlatformRepository::new(&overrides_from_config(&config), php.as_ref())?;
+    let build_latest = |ctx: &mut Context| -> Latest<'static> {
+        let root = ctx.root.as_ref().unwrap();
+        let mut set = RepositorySet::new(
+            root.minimum_stability,
+            root.stability_flags.clone(),
+            &[],
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+        for repo in std::mem::take(&mut ctx.repos) {
+            // the set outlives the command; one leak per `show --latest`
+            set.add(Repository::Composer(Box::leak(Box::new(repo))));
+        }
+        Latest {
+            set,
+            platform: latest_platform.clone(),
+            minimum_stability: root.minimum_stability,
+            flags: root.stability_flags.clone(),
+            prefer_stable: root.prefer_stable,
+        }
+    };
 
     // single package
     let filter = args.package.as_deref();
@@ -271,6 +413,32 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         (None, vec![])
     };
     if let Some(package) = package {
+        if args.tree {
+            let tree = generate_package_tree(&mut ctx, io, &package)?;
+            if args.format == "json" {
+                let mut out = Map::new();
+                out.insert("installed".into(), Value::Array(vec![tree]));
+                io.write(&encode(&Value::Object(out), true, true, true));
+            } else {
+                display_package_tree(io, &[tree]);
+            }
+            return Ok(0);
+        }
+        let mut exit_code = 0;
+        let latest_package = if show_latest {
+            let l = latest.get_or_insert_with(|| build_latest(&mut ctx));
+            find_latest_package(io, l, &package, args, &filter_reqs)?
+        } else {
+            None
+        };
+        if args.outdated
+            && args.strict
+            && latest_package.as_ref().is_some_and(|l| {
+                l.full_pretty_version() != package.full_pretty_version() && !l.is_abandoned()
+            })
+        {
+            exit_code = 1;
+        }
         if args.path {
             let path =
                 install_path(&ctx.vendor_dir, &package).map(|p| crate::fs::realpath(Path::new(&p)));
@@ -282,9 +450,30 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             return Ok(0);
         }
         if args.format == "json" {
-            print_package_json(&ctx, io, &package, &versions);
+            print_package_json(&ctx, io, &package, &versions, latest_package.as_ref());
         } else {
-            print_package_text(&ctx, io, &package, &versions);
+            print_package_text(&ctx, io, &package, &versions, latest_package.as_ref());
+        }
+        return Ok(exit_code);
+    }
+
+    // tree view
+    if args.tree {
+        let requires = root_requires(&ctx.root);
+        let mut packages: Vec<Package> = ctx.installed.clone();
+        packages.sort_by_key(solver::to_string);
+        let mut trees = Vec::new();
+        for package in packages {
+            if requires.contains(&package.name) {
+                trees.push(generate_package_tree(&mut ctx, io, &package)?);
+            }
+        }
+        if args.format == "json" {
+            let mut out = Map::new();
+            out.insert("installed".into(), Value::Array(trees));
+            io.write(&encode(&Value::Object(out), true, true, true));
+        } else {
+            display_package_tree(io, &trees);
         }
         return Ok(0);
     }
@@ -344,6 +533,14 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     let indent = if args.all { "  " } else { "" };
     let mut view: Vec<Section> = Vec::new();
     let requires = root_requires(&ctx.root);
+    let ignored = crate::repository::package_names_to_regexp(
+        &args
+            .ignore
+            .iter()
+            .map(|i| i.to_lowercase())
+            .collect::<Vec<_>>(),
+    );
+    let mut exit_code = 0;
     for (kind, show_version) in [
         ("platform", true),
         ("locked", true),
@@ -355,14 +552,50 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         };
         let write_path = !args.name_only && args.path && path_option;
         let write_version = !args.name_only && !args.path && show_version;
+        let write_latest = write_version && show_latest;
         let write_description = !args.name_only && !args.path;
+        let write_release_date = write_latest && (args.sort_by_age || args.format == "json");
         let mut name_length = 0;
         let mut version_length = 0;
+        let mut latest_length = 0;
+        let mut release_date_length = 0;
+        let mut has_outdated = false;
         let mut rows = Vec::new();
-        for entry in section.values() {
+        let mut entries: Vec<&Entry> = section.values().collect();
+        if args.sort_by_age {
+            crate::zend_sort::usort(&mut entries, |a, b| match (a, b) {
+                (Entry::Pkg(x), Entry::Pkg(y)) => x
+                    .release_date
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(y.release_date.as_deref().unwrap_or("")),
+                _ => std::cmp::Ordering::Equal,
+            });
+        }
+        for entry in entries {
             let mut row = Map::new();
             match entry {
                 Entry::Pkg(package) => {
+                    let mut latest_package: Option<Package> = None;
+                    if show_latest
+                        && kind != "available"
+                        && (args.ignore.is_empty() || !ignored.is_match(&package.pretty_name))
+                    {
+                        let l = latest.get_or_insert_with(|| build_latest(&mut ctx));
+                        latest_package = find_latest_package(io, l, package, args, &filter_reqs)?;
+                    }
+                    let up_to_date = latest_package.as_ref().is_some_and(|l| {
+                        l.full_pretty_version() == package.full_pretty_version()
+                            && !l.is_abandoned()
+                    }) || (latest_package.is_none() && args.major_only);
+                    let is_ignored =
+                        !args.ignore.is_empty() && ignored.is_match(&package.pretty_name);
+                    if args.outdated && (is_ignored || up_to_date) {
+                        continue;
+                    }
+                    if (args.outdated || args.strict) && !up_to_date {
+                        has_outdated = true;
+                    }
                     row.insert("name".into(), Value::String(package.pretty_name.clone()));
                     row.insert(
                         "direct-dependency".into(),
@@ -387,6 +620,59 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
                         version_length = version_length.max(version.len());
                         row.insert("version".into(), Value::String(version));
                     }
+                    if write_release_date {
+                        match &package.release_date {
+                            Some(date) => {
+                                let mut age = relative_time(date).replace(" ago", " old");
+                                if !age.contains(" old") {
+                                    age = format!("from {age}");
+                                }
+                                release_date_length = release_date_length.max(age.len());
+                                row.insert("release-age".into(), Value::String(age));
+                                row.insert(
+                                    "release-date".into(),
+                                    Value::String(crate::package::dumper::rfc3339(date)),
+                                );
+                            }
+                            None => {
+                                row.insert("release-age".into(), Value::String(String::new()));
+                                row.insert("release-date".into(), Value::String(String::new()));
+                            }
+                        }
+                    }
+                    if write_latest {
+                        match &latest_package {
+                            Some(l) => {
+                                let mut version = l.full_pretty_version();
+                                if args.format == "text" {
+                                    version = version.trim_start_matches('v').to_string();
+                                }
+                                latest_length = latest_length.max(version.len());
+                                row.insert("latest".into(), Value::String(version));
+                                row.insert(
+                                    "latest-release-date".into(),
+                                    Value::String(
+                                        l.release_date
+                                            .as_deref()
+                                            .map(crate::package::dumper::rfc3339)
+                                            .unwrap_or_default(),
+                                    ),
+                                );
+                                row.insert(
+                                    "latest-status".into(),
+                                    Value::String(update_status(l, package)),
+                                );
+                            }
+                            None => {
+                                latest_length = latest_length.max("[none matched]".len());
+                                row.insert("latest".into(), Value::String("[none matched]".into()));
+                                row.insert(
+                                    "latest-status".into(),
+                                    Value::String("up-to-date".into()),
+                                );
+                            }
+                        }
+                    }
                     if write_description {
                         row.insert(
                             "description".into(),
@@ -401,7 +687,29 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
                             .map(|p| first_line(&crate::fs::realpath(Path::new(&p))));
                         row.insert("path".into(), path.map_or(Value::Null, Value::String));
                     }
-                    row.insert("abandoned".into(), Value::Bool(false));
+                    let mut abandoned = Value::Bool(false);
+                    if let Some(l) = &latest_package
+                        && l.is_abandoned()
+                    {
+                        let replacement = match l.replacement_package() {
+                            Some(r) => {
+                                abandoned = Value::String(r.clone());
+                                format!("Use {r} instead")
+                            }
+                            None => {
+                                abandoned = Value::Bool(true);
+                                "No replacement was suggested".into()
+                            }
+                        };
+                        row.insert(
+                            "warning".into(),
+                            Value::String(format!(
+                                "Package {} is abandoned, you should avoid using it. {replacement}.",
+                                package.pretty_name
+                            )),
+                        );
+                    }
+                    row.insert("abandoned".into(), abandoned);
                 }
                 Entry::Name(name) => {
                     row.insert("name".into(), Value::String(name.clone()));
@@ -410,47 +718,395 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             }
             rows.push(row);
         }
-        view.push((kind, rows, name_length, version_length));
+        view.push(Section {
+            kind,
+            rows,
+            name_length,
+            version_length,
+            latest_length,
+            release_date_length,
+            write_latest,
+            write_release_date,
+        });
+        if args.strict && has_outdated {
+            exit_code = 1;
+            break;
+        }
     }
 
     if args.format == "json" {
         let mut out = Map::new();
-        for (kind, rows, _, _) in view {
+        for section in view {
             out.insert(
-                kind.to_string(),
-                Value::Array(rows.into_iter().map(Value::Object).collect()),
+                section.kind.to_string(),
+                Value::Array(section.rows.into_iter().map(Value::Object).collect()),
             );
         }
         io.write(&encode(&Value::Object(out), true, true, true));
-        return Ok(0);
+        return Ok(exit_code);
     }
 
+    if args.latest && view.iter().any(|s| !s.rows.is_empty()) {
+        io.error("Legend:");
+        io.error("! patch or minor release available - update recommended");
+        io.error("~ major release available - update possible");
+        if !args.outdated {
+            io.error("= up to date version");
+        }
+    }
     let width = Io::terminal_width();
     // Composer's `$writeVersion`/`$writeDescription` are whatever the last prepared type left behind
-    let last_shows_version = view.last().is_some_and(|(kind, ..)| *kind != "available");
+    let last_shows_version = view.last().is_some_and(|s| s.kind != "available");
     let write_version = !args.name_only && !args.path && last_shows_version;
     let write_description = !args.name_only && !args.path;
-    for (kind, rows, name_length, version_length) in view {
+    for section in view {
+        let Section {
+            kind,
+            rows,
+            name_length,
+            version_length,
+            mut latest_length,
+            release_date_length,
+            write_latest,
+            write_release_date,
+        } = section;
         let version_fits = name_length + version_length + 3 <= width;
-        let description_fits = name_length + version_length + 24 <= width;
+        let latest_fits = name_length + version_length + latest_length + 3 <= width;
+        let release_date_fits =
+            name_length + version_length + latest_length + release_date_length + 3 <= width;
+        let description_fits =
+            name_length + version_length + latest_length + release_date_length + 24 <= width;
+        if latest_fits {
+            latest_length += 2;
+        }
         if args.all {
             io.write(&format!("{kind}:"));
         }
-        print_packages(
-            io,
-            &rows,
+        let layout = Layout {
             indent,
-            write_version && version_fits,
-            write_description && description_fits,
+            write_version: write_version && version_fits,
+            write_latest: write_latest && latest_fits,
+            write_description: write_description && description_fits,
+            write_release_date: write_release_date && release_date_fits,
             width,
-            version_length,
             name_length,
-        );
+            version_length,
+            latest_length,
+            release_date_length,
+        };
+        if write_latest && !args.direct {
+            let (direct, transitive): (Vec<_>, Vec<_>) = rows
+                .into_iter()
+                .partition(|r| r.get("direct-dependency") == Some(&Value::Bool(true)));
+            io.error("");
+            io.error("Direct dependencies required in composer.json:");
+            if direct.is_empty() {
+                io.error("Everything up to date");
+            } else {
+                print_packages(io, &direct, &layout);
+            }
+            io.error("");
+            io.error("Transitive dependencies not required in composer.json:");
+            if transitive.is_empty() {
+                io.error("Everything up to date");
+            } else {
+                print_packages(io, &transitive, &layout);
+            }
+        } else if write_latest && rows.is_empty() {
+            io.error("All your direct dependencies are up to date");
+        } else {
+            print_packages(io, &rows, &layout);
+        }
         if args.all {
             io.write("");
         }
     }
-    Ok(0)
+    Ok(exit_code)
+}
+
+fn clone_args(args: &Args) -> Args {
+    Args {
+        package: args.package.clone(),
+        version: args.version.clone(),
+        all: args.all,
+        locked: args.locked,
+        installed: args.installed,
+        platform: args.platform,
+        available: args.available,
+        self_: args.self_,
+        name_only: args.name_only,
+        path: args.path,
+        format: args.format.clone(),
+        no_dev: args.no_dev,
+        direct: args.direct,
+        latest: args.latest,
+        outdated: args.outdated,
+        ignore: args.ignore.clone(),
+        minor_only: args.minor_only,
+        patch_only: args.patch_only,
+        major_only: args.major_only,
+        sort_by_age: args.sort_by_age,
+        strict: args.strict,
+        tree: args.tree,
+        ignore_platform_req: args.ignore_platform_req.clone(),
+        ignore_platform_reqs: args.ignore_platform_reqs,
+    }
+}
+
+/// `ShowCommand::getUpdateStatus`
+fn update_status(latest: &Package, package: &Package) -> String {
+    if latest.full_pretty_version() == package.full_pretty_version() {
+        return "up-to-date".into();
+    }
+    let constraint = if package.version.starts_with("dev-") {
+        package.version.clone()
+    } else {
+        format!("^{}", package.version)
+    };
+    let satisfied = version_parser::parse_constraints(&constraint)
+        .ok()
+        .zip(version_parser::normalize(&latest.version, None).ok())
+        .is_some_and(|(c, v)| c.matches(&Constraint::new("==", &v)));
+    if !latest.version.is_empty() && satisfied {
+        return "semver-safe-update".into();
+    }
+    "update-possible".into()
+}
+
+/// `ShowCommand::findLatestPackage`
+fn find_latest_package(
+    io: &mut Io,
+    latest: &mut Latest<'_>,
+    package: &Package,
+    args: &Args,
+    filter: &RequirementFilter,
+) -> Result<Option<Package>, String> {
+    let name = &package.name;
+    let mut stability = latest.minimum_stability;
+    if let Some(flag) = latest.flags.get(name) {
+        stability = [
+            Stability::Stable,
+            Stability::RC,
+            Stability::Beta,
+            Stability::Alpha,
+            Stability::Dev,
+        ]
+        .into_iter()
+        .find(|s| s.priority() == *flag)
+        .unwrap_or(stability);
+    }
+    let best_stability = if latest.prefer_stable {
+        package.stability()
+    } else {
+        stability
+    };
+    let mut target: Option<String> = None;
+    if package.version.starts_with("dev-") {
+        target = Some(package.version.clone());
+        if args.major_only {
+            return Ok(None);
+        }
+    }
+    if target.is_none() {
+        if args.major_only
+            && let Some(m) =
+                regex::Regex::new(r"^(?P<zero_major>(?:0\.)+)?(?P<first_meaningful>\d+)\.")
+                    .unwrap()
+                    .captures(&package.version)
+        {
+            let first: u64 = m["first_meaningful"].parse().unwrap_or(0);
+            target = Some(format!(
+                ">={}{},<9999999-dev",
+                m.name("zero_major").map_or("", |z| z.as_str()),
+                first + 1
+            ));
+        }
+        if args.minor_only {
+            target = Some(format!("^{}", package.version));
+        }
+        if args.patch_only {
+            let mut trimmed = regex::Regex::new(r"(\.0)+$")
+                .unwrap()
+                .replace(&package.version, "")
+                .into_owned();
+            let parts_needed = if trimmed.starts_with('0') { 4 } else { 3 };
+            while trimmed.matches('.').count() + 1 < parts_needed {
+                trimmed.push_str(".0");
+            }
+            target = Some(format!("~{trimmed}"));
+        }
+    }
+    let mut selector = VersionSelector::new(&mut latest.set, Some(&latest.platform));
+    let candidate = selector.find_best_candidate(
+        io,
+        name,
+        target.as_deref(),
+        best_stability,
+        filter,
+        0,
+        io.verbosity >= 1,
+    )?;
+    Ok(candidate.map(|(_, mut c)| {
+        while let Some(real) = c.alias_of.take() {
+            c = *real;
+        }
+        c
+    }))
+}
+
+/// `generatePackageTree`
+fn generate_package_tree(
+    ctx: &mut Context,
+    io: &mut Io,
+    package: &Package,
+) -> Result<Value, String> {
+    let mut requires: Vec<&crate::package::Link> = package.requires.iter().collect();
+    requires.sort_by(|a, b| a.target.cmp(&b.target));
+    let mut children = Vec::new();
+    for link in requires {
+        let in_tree = vec![package.name.clone(), link.target.clone()];
+        let mut child = Map::new();
+        child.insert("name".into(), Value::String(link.target.clone()));
+        child.insert(
+            "version".into(),
+            Value::String(link.pretty_constraint.clone()),
+        );
+        if let Some(installed) = installed_version(ctx, &link.target) {
+            child.insert("installed".into(), Value::String(installed));
+        }
+        let deep = add_tree(ctx, io, link, &in_tree)?;
+        if !deep.is_empty() {
+            child.insert("requires".into(), Value::Array(deep));
+        }
+        children.push(Value::Object(child));
+    }
+    let mut tree = Map::new();
+    tree.insert("name".into(), Value::String(package.pretty_name.clone()));
+    tree.insert(
+        "version".into(),
+        Value::String(package.pretty_version.clone()),
+    );
+    tree.insert(
+        "description".into(),
+        Value::String(package.description.clone().unwrap_or_default()),
+    );
+    if !children.is_empty() {
+        tree.insert("requires".into(), Value::Array(children));
+    }
+    Ok(Value::Object(tree))
+}
+
+/// `addTree`
+fn add_tree(
+    ctx: &mut Context,
+    io: &mut Io,
+    link: &crate::package::Link,
+    in_tree: &[String],
+) -> Result<Vec<Value>, String> {
+    let constraint = if link.pretty_constraint == "self.version" {
+        link.constraint.to_string()
+    } else {
+        link.pretty_constraint.clone()
+    };
+    let Ok((Some(package), _)) = get_package(ctx, io, &link.target, Some(&constraint)) else {
+        return Ok(vec![]);
+    };
+    let mut requires: Vec<&crate::package::Link> = package.requires.iter().collect();
+    requires.sort_by(|a, b| a.target.cmp(&b.target));
+    let mut children = Vec::new();
+    for require in requires {
+        let mut current = in_tree.to_vec();
+        let mut child = Map::new();
+        child.insert("name".into(), Value::String(require.target.clone()));
+        child.insert(
+            "version".into(),
+            Value::String(require.pretty_constraint.clone()),
+        );
+        if let Some(installed) = installed_version(ctx, &require.target) {
+            child.insert("installed".into(), Value::String(installed));
+        }
+        if !current.contains(&require.target) {
+            current.push(require.target.clone());
+            let deep = add_tree(ctx, io, require, &current)?;
+            if !deep.is_empty() {
+                child.insert("requires".into(), Value::Array(deep));
+            }
+        }
+        children.push(Value::Object(child));
+    }
+    Ok(children)
+}
+
+/// `getInstalledVersion`: the installed package providing `name`, aliases resolved.
+fn installed_version(ctx: &Context, name: &str) -> Option<String> {
+    let installed: Vec<&Package> = ctx.installed.iter().collect();
+    let found = crate::lock::find_with_replacers_and_providers(&installed, name, None);
+    let mut package = (*found.first()?).clone();
+    while let Some(real) = package.alias_of.take() {
+        package = *real;
+    }
+    Some(package.pretty_version)
+}
+
+/// `displayPackageTree` and `displayTree`, without colors.
+fn display_package_tree(io: &mut Io, trees: &[Value]) {
+    for package in trees {
+        let name = package.get("name").and_then(Value::as_str).unwrap_or("");
+        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
+        let mut line = format!("{name} {version}");
+        if let Some(description) = package.get("description").and_then(Value::as_str) {
+            line.push(' ');
+            line.push_str(&first_line(description));
+        }
+        io.write(&line);
+        let Some(Value::Array(requires)) = package.get("requires") else {
+            continue;
+        };
+        let total = requires.len();
+        let mut tree_bar = "├".to_string();
+        for (j, require) in requires.iter().enumerate() {
+            if j + 1 == total {
+                tree_bar = "└".into();
+            }
+            let require_name = require.get("name").and_then(Value::as_str).unwrap_or("");
+            let require_version = require.get("version").and_then(Value::as_str).unwrap_or("");
+            io.write(&crate::commands::table::plain_tree_line(&format!(
+                "{tree_bar}──{require_name} {require_version}"
+            )));
+            tree_bar = tree_bar.replace('└', " ");
+            let in_tree = vec![name.to_string(), require_name.to_string()];
+            display_tree(io, require, &in_tree, &tree_bar);
+        }
+    }
+}
+
+fn display_tree(io: &mut Io, package: &Value, in_tree: &[String], previous_tree_bar: &str) {
+    let previous = previous_tree_bar.replace('├', "│");
+    let Some(Value::Array(requires)) = package.get("requires") else {
+        return;
+    };
+    let total = requires.len();
+    let mut tree_bar = format!("{previous}  ├");
+    for (i, require) in requires.iter().enumerate() {
+        let mut current = in_tree.to_vec();
+        if i + 1 == total {
+            tree_bar = format!("{previous}  └");
+        }
+        let name = require.get("name").and_then(Value::as_str).unwrap_or("");
+        let version = require.get("version").and_then(Value::as_str).unwrap_or("");
+        let circular = if current.iter().any(|n| n == name) {
+            "(circular dependency aborted here)"
+        } else {
+            ""
+        };
+        let line = format!("{tree_bar}──{name} {version} {circular}")
+            .trim_end()
+            .to_string();
+        io.write(&crate::commands::table::plain_tree_line(&line));
+        tree_bar = tree_bar.replace('└', " ");
+        current.push(name.to_string());
+        display_tree(io, require, &current, &tree_bar);
+    }
 }
 
 fn no_composer_error() -> String {
@@ -485,8 +1141,12 @@ fn root_requires(root: &Option<RootPackage>) -> Vec<String> {
         .collect()
 }
 
-/// `RepositoryUtils::filterRequiredPackages`
-fn filter_required_packages(
+/// `RepositoryUtils::filterRequiredPackages` for the root package's non-dev requires.
+pub fn filter_required_packages(packages: &[Package], root: &Package) -> Vec<Package> {
+    filter_required_packages_into(packages, root, &mut vec![])
+}
+
+fn filter_required_packages_into(
     packages: &[Package],
     requirer: &Package,
     bucket: &mut Vec<Package>,
@@ -501,7 +1161,7 @@ fn filter_required_packages(
             if requires.contains(&name.as_str()) {
                 if !bucket.iter().any(|b| b == candidate) {
                     bucket.push(candidate.clone());
-                    filter_required_packages(packages, candidate, bucket);
+                    filter_required_packages_into(packages, candidate, bucket);
                 }
                 break;
             }
@@ -553,13 +1213,19 @@ fn get_package(
     let sources = std::mem::take(&mut ctx.sources);
     for (_, source) in &sources {
         match source {
+            // Pool::match: the name itself, or a provide/replace of it
             Source::Packages(list) => candidates.extend(
                 list.iter()
-                    .filter(|p| p.name == name)
                     .filter(|p| {
-                        constraint
-                            .as_ref()
-                            .is_none_or(|c| c.matches(&Constraint::new("==", &p.version)))
+                        if p.name == name {
+                            return constraint
+                                .as_ref()
+                                .is_none_or(|c| c.matches(&Constraint::new("==", &p.version)));
+                        }
+                        p.provides.iter().chain(p.replaces.iter()).any(|l| {
+                            l.target == name
+                                && constraint.as_ref().is_none_or(|c| c.matches(&l.constraint))
+                        })
                     })
                     .cloned(),
             ),
@@ -668,6 +1334,7 @@ fn print_package_json(
     io: &mut Io,
     package: &Package,
     versions: &[(String, String)],
+    latest: Option<&Package>,
 ) {
     let mut json = Map::new();
     json.insert("name".into(), Value::String(package.pretty_name.clone()));
@@ -716,6 +1383,10 @@ fn print_package_json(
             Value::Array(package.license.iter().map(|l| license_json(l)).collect()),
         );
     }
+    if let Some(l) = latest {
+        json.insert("latest".into(), Value::String(l.pretty_version.clone()));
+    }
+    let latest = latest.unwrap_or(package);
     if let Some(source) = &package.source {
         let mut m = Map::new();
         m.insert("type".into(), Value::String(source.kind.clone()));
@@ -755,10 +1426,10 @@ fn print_package_json(
             );
         }
     }
-    if package.is_abandoned() {
+    if latest.is_abandoned() {
         json.insert(
             "replacement".into(),
-            package
+            latest
                 .replacement_package()
                 .map_or(Value::Null, Value::String),
         );
@@ -805,6 +1476,7 @@ fn print_package_text(
     io: &mut Io,
     package: &Package,
     versions: &[(String, String)],
+    latest: Option<&Package>,
 ) {
     let is_installed = !is_platform_package(&package.name) && installed_has(ctx, package);
     io.write(&format!("name     : {}", package.pretty_name));
@@ -859,6 +1531,20 @@ fn print_package_text(
     {
         io.write(&format!("released : {day}, {}", relative_time(date)));
     }
+    if let Some(l) = latest {
+        let released = match &l.release_date {
+            Some(date) => format!(
+                " released {}, {}",
+                crate::package::dumper::rfc3339(date)
+                    .get(..10)
+                    .unwrap_or(""),
+                relative_time(date)
+            ),
+            None => String::new(),
+        };
+        io.write(&format!("latest   : {}{released}", l.pretty_version));
+    }
+    let latest = latest.unwrap_or(package);
     io.write(&format!("type     : {}", package.kind));
     for id in &package.license {
         let line = match crate::spdx::license_by_identifier(id) {
@@ -910,8 +1596,8 @@ fn print_package_text(
         ));
     }
     io.write(&format!("names    : {}", names(package).join(", ")));
-    if package.is_abandoned() {
-        let replacement = package
+    if latest.is_abandoned() {
+        let replacement = latest
             .replacement_package()
             .map(|r| format!(" The author suggests using the {r} package instead."))
             .unwrap_or_default();
@@ -1045,20 +1731,37 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// `printPackages` without `--latest` columns.
-#[allow(clippy::too_many_arguments)]
-fn print_packages(
-    io: &mut Io,
-    rows: &[Map<String, Value>],
-    indent: &str,
+struct Layout<'a> {
+    indent: &'a str,
     write_version: bool,
+    write_latest: bool,
     write_description: bool,
+    write_release_date: bool,
     width: usize,
-    version_length: usize,
     name_length: usize,
-) {
-    let pad_name = write_version || write_description;
-    let pad_version = write_description;
+    version_length: usize,
+    latest_length: usize,
+    release_date_length: usize,
+}
+
+/// `printPackages`
+fn print_packages(io: &mut Io, rows: &[Map<String, Value>], layout: &Layout<'_>) {
+    let Layout {
+        indent,
+        write_version,
+        write_latest,
+        write_description,
+        write_release_date,
+        width,
+        name_length,
+        version_length,
+        latest_length,
+        release_date_length,
+    } = *layout;
+    let pad_name = write_version || write_latest || write_release_date || write_description;
+    let pad_version = write_latest || write_release_date || write_description;
+    let pad_latest = write_description || write_release_date;
+    let pad_release_date = write_description;
     let str_of = |row: &Map<String, Value>, key: &str| -> Option<String> {
         row.get(key).and_then(Value::as_str).map(str::to_string)
     };
@@ -1077,11 +1780,42 @@ fn print_packages(
                 line.push_str(&" ".repeat(version_length.saturating_sub(version.len())));
             }
         }
+        if let (Some(latest), Some(status)) = (str_of(row, "latest"), str_of(row, "latest-status"))
+            && write_latest
+        {
+            let marker = match status.as_str() {
+                "up-to-date" => "=",
+                "semver-safe-update" => "!",
+                "update-possible" => "~",
+                "cooldown" => "c",
+                other => other,
+            };
+            let latest = format!("{marker} {latest}");
+            line.push(' ');
+            line.push_str(&latest);
+            if pad_latest {
+                line.push_str(&" ".repeat(latest_length.saturating_sub(latest.len())));
+            }
+            if write_release_date && let Some(age) = str_of(row, "release-age") {
+                line.push(' ');
+                line.push_str(&age);
+                if pad_release_date {
+                    line.push_str(&" ".repeat(release_date_length.saturating_sub(age.len())));
+                }
+            }
+        }
         if let Some(description) = str_of(row, "description")
             && write_description
         {
             let mut description = first_line(&description);
-            let remaining = width as i64 - name_length as i64 - version_length as i64 - 4;
+            let mut remaining = width as i64
+                - name_length as i64
+                - version_length as i64
+                - release_date_length as i64
+                - 4;
+            if write_latest {
+                remaining -= latest_length as i64;
+            }
             if remaining <= 0 {
                 description = String::new();
             } else if description.chars().count() as i64 > remaining {
@@ -1097,5 +1831,8 @@ fn print_packages(
             line.push_str(path.as_str().unwrap_or("null"));
         }
         io.write(&Io::clean(&line));
+        if let Some(warning) = str_of(row, "warning") {
+            io.write(&warning);
+        }
     }
 }

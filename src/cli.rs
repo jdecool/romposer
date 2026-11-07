@@ -55,6 +55,22 @@ enum Command {
     /// Removes a package from the require or require-dev.
     #[command(visible_alias = "rm")]
     Remove(commands::remove::Args),
+    /// Shows a list of installed packages that have updates available, including their latest version.
+    Outdated(commands::readonly::OutdatedArgs),
+    /// Shows information about licenses of dependencies.
+    Licenses(commands::readonly::LicensesArgs),
+    /// Discover how to help fund the maintenance of your dependencies.
+    Fund(commands::readonly::FundArgs),
+    /// Shows package suggestions.
+    Suggests(commands::readonly::SuggestsArgs),
+    /// Shows a list of locally modified packages.
+    Status(commands::readonly::StatusArgs),
+    /// Shows which packages cause the given package to be installed.
+    #[command(visible_alias = "why")]
+    Depends(commands::depends::Args),
+    /// Shows which packages prevent the given package from being installed.
+    #[command(visible_alias = "why-not")]
+    Prohibits(commands::depends::Args),
     /// Dumps the autoloader.
     #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
     DumpAutoload(commands::dump_autoload::Args),
@@ -95,6 +111,13 @@ pub fn run() -> i32 {
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
         Some(Command::Search(args)) => commands::search::run(&args, &mut io),
         Some(Command::Show(args)) => commands::show::run(&args, &mut io),
+        Some(Command::Outdated(args)) => commands::readonly::outdated(&args, &mut io),
+        Some(Command::Licenses(args)) => commands::readonly::licenses(&args, &mut io),
+        Some(Command::Fund(args)) => commands::readonly::fund(&args, &mut io),
+        Some(Command::Suggests(args)) => commands::readonly::suggests(&args, &mut io),
+        Some(Command::Status(args)) => commands::readonly::status(&args, &mut io),
+        Some(Command::Depends(args)) => commands::depends::depends(&args, &mut io),
+        Some(Command::Prohibits(args)) => commands::depends::prohibits(&args, &mut io),
         Some(Command::CheckPlatformReqs(args)) => {
             commands::check_platform_reqs::run(&args, &mut io)
         }

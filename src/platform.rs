@@ -133,7 +133,7 @@ pub enum Override {
     Disabled,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PlatformRepository {
     pub packages: Vec<Package>,
     pub disabled: BTreeMap<String, Package>,
