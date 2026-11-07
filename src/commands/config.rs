@@ -134,11 +134,12 @@ impl ConfigSource {
             restore_empty_objects(&mut data);
             crate::json::encode_pretty(&Value::Object(data)) + "\n"
         };
-        if !exists {
-            create_private(&self.path);
+        if exists {
+            std::fs::write(&self.path, &written)
+        } else {
+            write_private(&self.path, &written)
         }
-        std::fs::write(&self.path, &written)
-            .map_err(|_| format!("The file \"{}\" is not writable.", self.path.display()))?;
+        .map_err(|_| format!("The file \"{}\" is not writable.", self.path.display()))?;
         let parsed: Value = serde_json::from_str(&written).unwrap_or(Value::Null);
         if let Err(errors) = crate::schema::validate(&parsed, false) {
             let _ = std::fs::write(&self.path, &contents);
@@ -255,14 +256,18 @@ impl ConfigSource {
     }
 }
 
-/// Creates `path` empty with mode 600 so secrets never sit in a world-readable file.
-fn create_private(path: &Path) {
+/// Writes a new file with mode 600, never through a symlink, so secrets are never readable
+/// by others; fails if anything already sits at `path`.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let _ = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path);
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .write_all(contents.as_bytes())
 }
 
 /// `splitPropertyKey`: extra/scripts nest two levels deep, suggest/autoload one.
@@ -889,8 +894,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     }
     if args.global && !config_file.exists() {
         let _ = std::fs::create_dir_all(&home);
-        create_private(&config_file);
-        std::fs::write(&config_file, "{\n    \"config\": {}\n}\n").map_err(|e| e.to_string())?;
+        write_private(&config_file, "{\n    \"config\": {}\n}\n").map_err(|e| e.to_string())?;
     }
     if !config_file.exists() {
         return Err(format!(
@@ -920,8 +924,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         .map(|k| format!("    \"{k}\": {{}}"))
         .collect::<Vec<_>>()
         .join(",\n");
-        create_private(&auth_file);
-        std::fs::write(&auth_file, format!("{{\n{empty}\n}}\n")).map_err(|e| e.to_string())?;
+        write_private(&auth_file, &format!("{{\n{empty}\n}}\n")).map_err(|e| e.to_string())?;
     }
     let source = ConfigSource::new(&config_file, false);
     let auth_source = ConfigSource::new(&auth_file, true);
