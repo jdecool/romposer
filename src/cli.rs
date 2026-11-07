@@ -46,6 +46,9 @@ enum Command {
     /// Installs the project dependencies from the composer.lock file if present, or falls back on the composer.json.
     #[command(visible_alias = "i")]
     Install(commands::install::Args),
+    /// Updates your dependencies to the latest version according to composer.json, and updates the composer.lock file.
+    #[command(visible_aliases = ["u", "upgrade"])]
+    Update(commands::update::Args),
     /// Dumps the autoloader.
     #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
     DumpAutoload(commands::dump_autoload::Args),
@@ -79,6 +82,7 @@ pub fn run() -> i32 {
     match cli.command {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
+        Some(Command::Update(args)) => commands::update::run(&args, &mut io),
         Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
         Some(Command::Search(args)) => commands::search::run(&args, &mut io),

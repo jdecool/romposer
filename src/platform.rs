@@ -1183,6 +1183,32 @@ impl RequirementFilter {
     }
 }
 
+/// `IniHelper::getAll`: the loaded php.ini (or an empty string) followed by the scanned files.
+pub fn ini_paths() -> Vec<String> {
+    let out = std::process::Command::new("php")
+        .args([
+            "-r",
+            "echo php_ini_loaded_file(), PHP_EOL, php_ini_scanned_files();",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return vec![String::new()];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.splitn(2, '\n');
+    let mut paths = vec![lines.next().unwrap_or("").trim().to_string()];
+    if let Some(scanned) = lines.next() {
+        paths.extend(
+            scanned
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

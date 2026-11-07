@@ -38,22 +38,36 @@ impl Operation {
 
     /// `OperationInterface::show(false)`
     pub fn show(&self) -> String {
+        self.show_with(false)
+    }
+
+    /// `show($lock)`: "Locking" instead of "Installing" for lock file operations.
+    pub fn show_with(&self, lock: bool) -> String {
         match self {
-            Operation::Install(p) => {
-                format!("Installing {} ({})", p.pretty_name, p.full_pretty_version())
-            }
+            Operation::Install(p) => format!(
+                "{} {} ({})",
+                if lock { "Locking" } else { "Installing" },
+                p.pretty_name,
+                p.full_pretty_version()
+            ),
             Operation::Update { initial, target } => {
                 let action = if crate::semver::is_upgrade(&initial.version, &target.version) {
                     "Upgrading"
                 } else {
                     "Downgrading"
                 };
-                format!(
-                    "{action} {} ({} => {})",
-                    initial.pretty_name,
-                    initial.full_pretty_version(),
-                    target.full_pretty_version()
-                )
+                let (mut from, mut to) =
+                    (initial.full_pretty_version(), target.full_pretty_version());
+                let source_ref = |p: &Package| p.source.as_ref().and_then(|s| s.reference.clone());
+                let dist_ref = |p: &Package| p.dist.as_ref().and_then(|d| d.reference.clone());
+                if from == to && source_ref(initial) != source_ref(target) {
+                    from = initial.full_pretty_version_ref();
+                    to = target.full_pretty_version_ref();
+                } else if from == to && dist_ref(initial) != dist_ref(target) {
+                    from = initial.full_pretty_version_dist_ref();
+                    to = target.full_pretty_version_dist_ref();
+                }
+                format!("{action} {} ({from} => {to})", initial.pretty_name)
             }
             Operation::Uninstall(p) => {
                 format!("Removing {} ({})", p.pretty_name, p.full_pretty_version())
@@ -112,6 +126,10 @@ fn package_sort(a: &Package, b: &Package) -> std::cmp::Ordering {
 /// `ValidatingArrayLoader::validatePackage`: the security subset re-applied to
 /// packages loaded without validation (installed.json, the lock).
 pub fn validate_package(package: &Package) -> Result<(), String> {
+    // the root package and platform packages are built locally
+    if package.name == "__root__" || is_platform_package(&package.name) {
+        return Ok(());
+    }
     if let Some(err) = crate::package::naming_error(&package.name, false) {
         return Err(format!(
             "Invalid package found during dependency resolution, aborting: {err}"

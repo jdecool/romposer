@@ -2,9 +2,10 @@
 //! freshness via `content-hash`, locked packages, missing-requirement report.
 
 use crate::json::{Map, Value, encode_compact};
-use crate::package::root::RootPackage;
+use crate::package::root::{AliasDef, RootPackage};
 use crate::package::{self, Package};
-use crate::semver::Constraint;
+use crate::semver::{self, Constraint};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// `JsonFile::CONFLICTED_CONTENT_HASH`
@@ -307,6 +308,206 @@ pub fn find_with_replacers_and_providers<'a>(
         }
     }
     matches
+}
+
+impl Lock {
+    fn str_key(&self, key: &str) -> Option<&str> {
+        self.data.get(key).and_then(Value::as_str)
+    }
+
+    /// `Locker::getMinimumStability`
+    pub fn minimum_stability(&self) -> semver::Stability {
+        self.str_key("minimum-stability")
+            .and_then(|s| semver::Stability::parse(s).ok())
+            .unwrap_or(semver::Stability::Stable)
+    }
+
+    /// `Locker::getStabilityFlags`
+    pub fn stability_flags(&self) -> BTreeMap<String, u8> {
+        self.data
+            .get("stability-flags")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as u8)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `Locker::getPreferStable` / `getPreferLowest`: `None` for lock files without the key.
+    pub fn prefer_stable(&self) -> Option<bool> {
+        self.data.get("prefer-stable").and_then(Value::as_bool)
+    }
+
+    pub fn prefer_lowest(&self) -> Option<bool> {
+        self.data.get("prefer-lowest").and_then(Value::as_bool)
+    }
+
+    /// `Locker::getPlatformOverrides`
+    pub fn platform_overrides(&self) -> Map<String, Value> {
+        self.data
+            .get("platform-overrides")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `Locker::getAliases`
+    pub fn aliases(&self) -> Vec<AliasDef> {
+        self.data
+            .get("aliases")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+                        Some(AliasDef {
+                            package: s("package")?,
+                            version: s("version")?,
+                            alias: s("alias")?,
+                            alias_normalized: s("alias_normalized")?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `Locker::getPlatformRequirements`: (name, constraint, pretty constraint)
+    pub fn platform_requirements(&self, with_dev: bool) -> Vec<(String, Constraint, String)> {
+        let mut keys = vec!["platform"];
+        if with_dev {
+            keys.push("platform-dev");
+        }
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(Value::Object(reqs)) = self.data.get(key) {
+                for (name, constraint) in reqs {
+                    let pretty = constraint.as_str().unwrap_or("").to_string();
+                    if let Ok(c) = semver::parse_constraints(&pretty) {
+                        out.push((name.to_lowercase(), c, pretty));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// `Locker::lockPackages`
+fn lock_packages(packages: &[Package]) -> Vec<Value> {
+    let mut locked: Vec<Map<String, Value>> = Vec::new();
+    for package in packages {
+        if package.alias_of.is_some() {
+            continue;
+        }
+        let mut spec = crate::package::dumper::dump(package);
+        spec.shift_remove("version_normalized");
+        let time = spec.shift_remove("time");
+        let published = spec.shift_remove("published-time");
+        if let Some(time) = time {
+            spec.insert("time".into(), time);
+        }
+        if let Some(published) = published {
+            spec.insert("published-time".into(), published);
+        }
+        spec.shift_remove("installation-source");
+        locked.push(spec);
+    }
+    locked.sort_by(|a, b| {
+        let name = |m: &Map<String, Value>, k: &str| {
+            m.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+        };
+        name(a, "name")
+            .cmp(&name(b, "name"))
+            .then_with(|| name(a, "version").cmp(&name(b, "version")))
+    });
+    locked.into_iter().map(Value::Object).collect()
+}
+
+/// `Locker::setLockData` without the write: the lock document.
+#[allow(clippy::too_many_arguments)]
+pub fn build_lock_data(
+    content_hash: &str,
+    packages: &[Package],
+    dev_packages: &[Package],
+    platform_reqs: &[(String, String)],
+    platform_dev_reqs: &[(String, String)],
+    aliases: &[AliasDef],
+    minimum_stability: semver::Stability,
+    stability_flags: &BTreeMap<String, u8>,
+    prefer_stable: bool,
+    prefer_lowest: bool,
+    platform_overrides: &Map<String, Value>,
+) -> Value {
+    let mut lock = Map::new();
+    lock.insert(
+        "_readme".into(),
+        serde_json::json!([
+            "This file locks the dependencies of your project to a known state",
+            "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+            "This file is @generated automatically"
+        ]),
+    );
+    lock.insert(
+        "content-hash".into(),
+        Value::String(content_hash.to_string()),
+    );
+    lock.insert("packages".into(), Value::Array(lock_packages(packages)));
+    lock.insert(
+        "packages-dev".into(),
+        Value::Array(lock_packages(dev_packages)),
+    );
+    let aliases: Vec<Value> = aliases
+        .iter()
+        .map(|a| {
+            let version = if matches!(a.version.as_str(), "dev-master" | "dev-trunk" | "dev-default") {
+                "9999999-dev"
+            } else {
+                &a.version
+            };
+            serde_json::json!({"package": a.package, "version": version, "alias": a.alias, "alias_normalized": a.alias_normalized})
+        })
+        .collect();
+    lock.insert("aliases".into(), Value::Array(aliases));
+    lock.insert(
+        "minimum-stability".into(),
+        Value::String(minimum_stability.as_str().to_string()),
+    );
+    let flags: Map<String, Value> = stability_flags
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::from(*v)))
+        .collect();
+    lock.insert("stability-flags".into(), Value::Object(flags));
+    lock.insert("prefer-stable".into(), Value::Bool(prefer_stable));
+    lock.insert("prefer-lowest".into(), Value::Bool(prefer_lowest));
+    let reqs = |list: &[(String, String)]| -> Value {
+        Value::Object(
+            list.iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect(),
+        )
+    };
+    lock.insert("platform".into(), reqs(platform_reqs));
+    lock.insert("platform-dev".into(), reqs(platform_dev_reqs));
+    if !platform_overrides.is_empty() {
+        lock.insert(
+            "platform-overrides".into(),
+            Value::Object(platform_overrides.clone()),
+        );
+    }
+    lock.insert(
+        "plugin-api-version".into(),
+        Value::String(crate::PLUGIN_API_VERSION.to_string()),
+    );
+    Value::Object(lock)
+}
+
+/// `JsonFile::write` of a lock document.
+pub fn write_lock(path: &Path, lock: &Value) -> Result<(), String> {
+    let json = crate::json::encode(lock, true, true, true) + "\n";
+    std::fs::write(path, json).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
 #[cfg(test)]

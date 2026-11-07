@@ -9,12 +9,23 @@ use crate::download::{Downloader, extract_zip};
 use crate::fs::{ensure_dir, is_dir_empty, realpath, remove};
 use crate::installed::InstalledRepository;
 use crate::io::Io;
+use crate::json::Value;
 use crate::lock::Lock;
 use crate::package::Package;
+use crate::package::root::AliasDef;
 use crate::package::root::RootPackage;
+use crate::platform::{PhpInfo, PlatformRepository, RequirementFilter};
+use crate::semver::{Constraint, Stability, parse_stability};
+use crate::solver::builder::{ArrayRepo, Repository, RepositorySet};
+use crate::solver::lock_transaction::LockTransaction;
+use crate::solver::policy::DefaultPolicy;
+use crate::solver::problem::Ctx;
+use crate::solver::sat::{Solver, SolverProblems};
+use crate::solver::{self, Pool, Request};
 use crate::store::{Manifest, Store, StoreConfig};
 use crate::transaction::{Operation, calculate_operations};
 use regex::Regex;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -47,6 +58,51 @@ pub struct Options {
     pub strict_psr_autoloader: bool,
     pub ignore_all_platform_reqs: bool,
     pub ignored_platform_reqs: Vec<String>,
+    pub update: bool,
+    pub install: bool,
+    pub update_mirrors: bool,
+    pub update_allow_list: Option<Vec<String>>,
+    pub update_allow_transitive: u8,
+    pub prefer_stable: bool,
+    pub prefer_lowest: bool,
+    pub minimal_update: bool,
+    pub temporary_constraints: Vec<(String, Constraint, String)>,
+    pub write_lock: bool,
+    pub execute_operations: bool,
+}
+
+impl Options {
+    /// `Installer::create` defaults: an install with everything on.
+    pub fn defaults() -> Options {
+        Options {
+            dev_mode: true,
+            dry_run: false,
+            download_only: false,
+            prefer_source: false,
+            prefer_dist: false,
+            dump_autoloader: true,
+            optimize_autoloader: false,
+            classmap_authoritative: false,
+            apcu_autoloader: false,
+            apcu_autoloader_prefix: None,
+            run_scripts: true,
+            verbose: false,
+            strict_psr_autoloader: false,
+            ignore_all_platform_reqs: false,
+            ignored_platform_reqs: vec![],
+            update: false,
+            install: true,
+            update_mirrors: false,
+            update_allow_list: None,
+            update_allow_transitive: solver::UPDATE_ONLY_LISTED,
+            prefer_stable: false,
+            prefer_lowest: false,
+            minimal_update: false,
+            temporary_constraints: vec![],
+            write_lock: true,
+            execute_operations: true,
+        }
+    }
 }
 
 /// Runs the operations of a transaction: on the filesystem, or as a trace (fixtures).
@@ -70,10 +126,19 @@ pub struct Installer<'a> {
     pub io: &'a mut Io,
     pub config: &'a Config,
     pub root: &'a RootPackage,
-    pub lock: &'a Lock,
+    pub lock: Option<Lock>,
+    /// where the lock is written; `None` keeps it in `written_lock` only (fixtures)
+    pub lock_path: Option<PathBuf>,
     pub composer_json: &'a str,
     pub options: Options,
     pub executor: &'a mut dyn Executor,
+    /// the remote repositories, in priority order
+    pub repos: Vec<Repository<'a>>,
+    pub php: Option<PhpInfo>,
+    /// the lock document produced by an update
+    pub written_lock: Option<Value>,
+    /// packages newly locked by the last update, for the suggestions summary
+    pub suggesting_packages: Vec<Package>,
 }
 
 /// `LibraryInstaller::getInstallPath`
@@ -117,8 +182,12 @@ struct StoreRun {
     fallback_warned: bool,
 }
 
-impl Installer<'_> {
-    /// `Installer::run` when a lock file exists, on the project's installed.json.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+impl<'a> Installer<'a> {
+    /// `Installer::run` on the project's installed.json.
     pub fn run(&mut self) -> Result<i32, String> {
         let vendor_dir = self.config.vendor_dir();
         let installed_path = PathBuf::from(format!("{vendor_dir}/composer/installed.json"));
@@ -126,27 +195,80 @@ impl Installer<'_> {
         self.run_with(&mut local_repo)
     }
 
+    fn filter(&self) -> RequirementFilter {
+        RequirementFilter::from_options(
+            self.options.ignore_all_platform_reqs,
+            &self.options.ignored_platform_reqs,
+        )
+    }
+
+    fn locked(&self) -> Option<&Lock> {
+        self.lock.as_ref().filter(|l| l.is_locked())
+    }
+
     /// `Installer::run` on a given local repository (the fixture runner's in-memory one).
     pub fn run_with(&mut self, local_repo: &mut InstalledRepository) -> Result<i32, String> {
+        if self.options.update_allow_list.is_some() && self.options.update_mirrors {
+            return Err(
+                "The installer options updateMirrors and updateAllowList are mutually exclusive."
+                    .into(),
+            );
+        }
+        let is_fresh_install = local_repo.is_fresh();
+        if !self.options.update && self.locked().is_none() {
+            let message = "Updating dependencies to latest instead of installing from lock file. See https://getcomposer.org/install for more information.";
+            if !self.options.write_lock {
+                self.io.warning(&format!(
+                    "Lockfile creation is disabled in config. {message}"
+                ));
+            } else {
+                self.io
+                    .warning(&format!("No composer.lock file present. {message}"));
+            }
+            self.options.update = true;
+        }
+        if self.options.dry_run {
+            self.options.verbose = true;
+            self.options.run_scripts = false;
+            self.options.execute_operations = false;
+            self.options.write_lock = false;
+            self.options.dump_autoloader = false;
+        }
+        if self.options.download_only {
+            self.options.dump_autoloader = false;
+        }
+        if self.options.update && !self.options.install {
+            self.options.dump_autoloader = false;
+        }
         let vendor_dir = self.config.vendor_dir();
-        let code = self.do_install(local_repo, &vendor_dir)?;
+        let code = if self.options.update {
+            self.do_update(local_repo, &vendor_dir)?
+        } else {
+            self.do_install(local_repo, &vendor_dir, false)?
+        };
         if code != 0 {
             return Ok(code);
         }
 
+        if self.options.update {
+            self.output_suggestions(is_fresh_install)?;
+        }
+
         // Find abandoned packages and warn user
-        for package in self.lock.locked_packages(true)? {
-            if package.alias_of.is_some() || !package.is_abandoned() {
-                continue;
+        if let Some(lock) = self.locked() {
+            for package in lock.locked_packages(true)? {
+                if package.alias_of.is_some() || !package.is_abandoned() {
+                    continue;
+                }
+                let replacement = match package.replacement_package() {
+                    Some(r) => format!("Use {r} instead"),
+                    None => "No replacement was suggested".into(),
+                };
+                self.io.warning(&format!(
+                    "Package {} is abandoned, you should avoid using it. {replacement}.",
+                    package.pretty_name
+                ));
             }
-            let replacement = match package.replacement_package() {
-                Some(r) => format!("Use {r} instead"),
-                None => "No replacement was suggested".into(),
-            };
-            self.io.error(&format!(
-                "Package {} is abandoned, you should avoid using it. {replacement}.",
-                package.pretty_name
-            ));
         }
 
         if self.options.dump_autoloader {
@@ -155,6 +277,8 @@ impl Installer<'_> {
             } else {
                 self.io.error("Generating autoload files");
             }
+        }
+        if self.options.dump_autoloader && self.executor.writes_files() {
             let options = crate::autoload::DumpOptions {
                 optimize: self.options.optimize_autoloader || self.options.classmap_authoritative,
                 authoritative: self.options.classmap_authoritative,
@@ -171,7 +295,7 @@ impl Installer<'_> {
                 self.config,
                 local_repo,
                 self.root,
-                Some(self.lock),
+                self.lock.as_ref(),
                 &options,
             )?;
             if self.options.strict_psr_autoloader && !class_map.psr_violations().is_empty() {
@@ -179,7 +303,7 @@ impl Installer<'_> {
             }
         }
 
-        if !self.options.dry_run && !self.options.download_only {
+        if self.options.install && self.options.execute_operations && self.executor.writes_files() {
             let mut binaries = self.binary_installer();
             for package in local_repo.canonical_packages() {
                 if let Some(path) = install_path(&vendor_dir, package) {
@@ -200,13 +324,58 @@ impl Installer<'_> {
         if show_funding && funding > 0 {
             self.io.error(&format!(
                 "{funding} package{} you are using {} looking for funding.",
-                if funding == 1 { "" } else { "s" },
+                plural(funding),
                 if funding == 1 { "is" } else { "are" }
             ));
             self.io
                 .error("Use the `composer fund` command to find out more!");
         }
         Ok(0)
+    }
+
+    /// `SuggestedPackagesReporter::outputMinimalistic` after an update.
+    fn output_suggestions(&mut self, is_fresh_install: bool) -> Result<(), String> {
+        let Some(lock) = self.locked() else {
+            return Ok(());
+        };
+        let mut installed = lock.locked_packages(self.options.dev_mode)?;
+        installed.extend(self.platform_repo(false)?.packages);
+        installed.push(self.root.package.clone());
+        // provided name => providing package names
+        let mut installed_names: HashMap<String, Vec<String>> = HashMap::new();
+        for package in &installed {
+            for name in solver::names(package, true) {
+                installed_names
+                    .entry(name)
+                    .or_default()
+                    .push(package.name.clone());
+            }
+        }
+        let mut suggestions: Vec<(String, String)> = Vec::new();
+        for package in &self.suggesting_packages {
+            for target in package.suggests.keys() {
+                suggestions.push((package.pretty_name.clone(), target.clone()));
+            }
+        }
+        if is_fresh_install {
+            for target in self.root.package.suggests.keys() {
+                suggestions.push((self.root.package.pretty_name.clone(), target.clone()));
+            }
+        }
+        let count = suggestions
+            .iter()
+            .filter(|(source, target)| {
+                !installed_names
+                    .get(target)
+                    .is_some_and(|providers| providers.iter().any(|p| *p != source.to_lowercase()))
+            })
+            .count();
+        if count > 0 {
+            self.io.error(&format!(
+                "{count} package suggestions were added by new dependencies, use `composer suggest` to see details."
+            ));
+        }
+        Ok(())
     }
 
     fn binary_installer(&self) -> BinaryInstaller {
@@ -217,14 +386,523 @@ impl Installer<'_> {
         }
     }
 
+    fn platform_repo(&self, for_update: bool) -> Result<PlatformRepository, String> {
+        let overrides = if for_update {
+            crate::platform::overrides_from_config(self.config)
+        } else {
+            self.locked()
+                .map(|l| l.platform_overrides())
+                .unwrap_or_default()
+        };
+        PlatformRepository::new(&overrides, self.php.as_ref())
+    }
+
+    /// `createRepositorySet`: root package repo first, then the platform repo.
+    fn create_repository_set(
+        &self,
+        for_update: bool,
+        platform: &'a PlatformRepository,
+        root_aliases: &[AliasDef],
+        locked_packages: Option<&[Package]>,
+    ) -> Result<(RepositorySet<'a>, Package), String> {
+        let filter = self.filter();
+        let (minimum_stability, mut flags, requires): SetInputs = if for_update {
+            let links = self
+                .root
+                .package
+                .requires
+                .iter()
+                .chain(self.root.package.dev_requires.iter());
+            (
+                self.root.minimum_stability,
+                self.root.stability_flags.clone(),
+                links
+                    .map(|l| {
+                        (
+                            l.target.clone(),
+                            l.constraint.clone(),
+                            l.pretty_constraint.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            let lock = self.locked().expect("lock");
+            (
+                lock.minimum_stability(),
+                lock.stability_flags(),
+                locked_packages
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.name.clone(),
+                            Constraint::new("=", &p.version),
+                            p.pretty_version.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let mut root_requires = Vec::new();
+        for (name, constraint, pretty) in requires {
+            if filter.is_ignored(&name) {
+                continue;
+            }
+            let constraint = filter.filter_constraint(&name, &constraint);
+            root_requires.push((name, constraint, pretty));
+        }
+        let mut fixed_root = self.root.package.clone();
+        fixed_root.requires = vec![];
+        fixed_root.dev_requires = vec![];
+        if let Some(real) = &mut fixed_root.alias_of {
+            real.requires = vec![];
+            real.dev_requires = vec![];
+        }
+        flags.insert(
+            self.root.package.name.clone(),
+            parse_stability(&self.root.package.version).priority(),
+        );
+        let mut set = RepositorySet::new(
+            minimum_stability,
+            flags,
+            root_aliases,
+            self.root.references.clone(),
+            root_requires,
+            self.options.temporary_constraints.clone(),
+        );
+        set.add(Repository::Root(fixed_root.clone()));
+        set.add(Repository::Platform(platform));
+        Ok((set, fixed_root))
+    }
+
+    fn create_policy(&self, for_update: bool, request: Option<&Request>) -> DefaultPolicy {
+        let (mut prefer_stable, mut prefer_lowest) = (None, None);
+        if !for_update && let Some(lock) = self.locked() {
+            prefer_stable = lock.prefer_stable();
+            prefer_lowest = lock.prefer_lowest();
+        }
+        let prefer_stable =
+            prefer_stable.unwrap_or(self.options.prefer_stable || self.root.prefer_stable);
+        let prefer_lowest = prefer_lowest.unwrap_or(self.options.prefer_lowest);
+        let mut preferred = None;
+        if for_update
+            && self.options.minimal_update
+            && let Some(request) = request
+            && let Some((_, locked)) = &request.locked_repo
+        {
+            let mut map = HashMap::new();
+            for p in locked {
+                if p.alias_of.is_some() || request.is_in_update_allow_list(&p.name) {
+                    continue;
+                }
+                map.insert(p.name.clone(), p.version.clone());
+            }
+            preferred = Some(map);
+        }
+        DefaultPolicy::new(prefer_stable, prefer_lowest, preferred)
+    }
+
+    /// `createRequest`: the root package and the platform packages are fixed.
+    fn create_request(
+        &self,
+        fixed_root: &Package,
+        platform: &PlatformRepository,
+        locked: Option<(usize, Vec<Package>)>,
+    ) -> Request {
+        let mut request = Request::new(locked);
+        request.fix_package(0, fixed_root);
+        if let Some(real) = &fixed_root.alias_of {
+            request.fix_package(0, real);
+        }
+        for package in &platform.packages {
+            let provided = fixed_root
+                .provides
+                .iter()
+                .find(|l| l.target == package.name)
+                .is_some_and(|l| {
+                    l.constraint
+                        .matches(&Constraint::new("=", &package.version))
+                });
+            if !provided {
+                request.fix_package(1, package);
+            }
+        }
+        request
+    }
+
+    fn require_packages_for_update(
+        &self,
+        request: &mut Request,
+        locked: Option<&[Package]>,
+        include_dev: bool,
+    ) -> Result<(), String> {
+        if self.options.update_mirrors {
+            let excluded: Vec<String> = if include_dev {
+                vec![]
+            } else {
+                self.locked()
+                    .map(|l| l.dev_package_names())
+                    .unwrap_or_default()
+            };
+            for package in locked.unwrap_or_default() {
+                if package.alias_of.is_none() && !excluded.contains(&package.name) {
+                    request.require_name(
+                        &package.name,
+                        Constraint::new("==", &package.version),
+                        &package.version,
+                    )?;
+                }
+            }
+        } else {
+            let mut links: Vec<&crate::package::Link> = self.root.package.requires.iter().collect();
+            if include_dev {
+                links.extend(self.root.package.dev_requires.iter());
+            }
+            for link in links {
+                request.require_name(
+                    &link.target,
+                    link.constraint.clone(),
+                    &link.pretty_constraint,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn report_problems(
+        &mut self,
+        problems: &SolverProblems,
+        set: &mut RepositorySet<'a>,
+        request: &Request,
+        pool: &Pool,
+        learned: &[Vec<usize>],
+        dev_extraction: bool,
+    ) -> Result<String, String> {
+        let installed = request.present_indices(pool);
+        let needs_ini = problems.problems.iter().any(|p| {
+            p.rules().iter().any(|r| {
+                r.required_package(pool)
+                    .is_some_and(|n| n.starts_with("ext-"))
+            })
+        });
+        let ini = if needs_ini {
+            crate::platform::ini_paths()
+        } else {
+            vec![]
+        };
+        let verbose = self.io.verbosity >= 1;
+        let extensions: HashSet<String> = self
+            .php
+            .as_ref()
+            .map(|p| p.extensions.iter().map(|e| e.to_lowercase()).collect())
+            .unwrap_or_default();
+        let mut ctx = Ctx {
+            io: self.io,
+            set,
+            request,
+            pool,
+            verbose,
+            installed,
+            learned_pool: learned,
+            extensions,
+        };
+        crate::solver::problem::problems_pretty_string(problems, &mut ctx, dev_extraction, &ini)
+    }
+
+    /// `Installer::doUpdate`
+    fn do_update(
+        &mut self,
+        local_repo: &mut InstalledRepository,
+        vendor_dir: &str,
+    ) -> Result<i32, String> {
+        let platform = self.platform_repo(true)?;
+        // the repository set borrows the platform repo for the whole update
+        let platform: &'a PlatformRepository = Box::leak(Box::new(platform));
+        let aliases = self.root.aliases.clone();
+        let locked_packages: Option<Vec<Package>> = match self.locked() {
+            Some(lock) => Some(lock.locked_packages(true)?),
+            None => None,
+        };
+        if (self.options.update_allow_list.is_some() || self.options.update_mirrors)
+            && locked_packages.is_none()
+        {
+            self.io.error(&format!(
+                "Cannot update {} without a lock file present. Run `composer update` to generate a lock file.",
+                if self.options.update_mirrors { "lock file information" } else { "only a partial set of packages" }
+            ));
+            return Ok(ERROR_NO_LOCK_FILE_FOR_PARTIAL_UPDATE);
+        }
+        self.io
+            .error("Loading composer repositories with package information");
+
+        let (mut set, fixed_root) = self.create_repository_set(true, platform, &aliases, None)?;
+        let remote_count = self.repos.len();
+        for repo in std::mem::take(&mut self.repos) {
+            set.add(repo);
+        }
+        let locked_index = locked_packages
+            .as_ref()
+            .map(|l| set.add(Repository::Locked(l.clone())));
+        let mut request = self.create_request(
+            &fixed_root,
+            platform,
+            locked_index.map(|i| (i, locked_packages.clone().unwrap())),
+        );
+        self.require_packages_for_update(&mut request, locked_packages.as_deref(), true)?;
+        if let Some(list) = &self.options.update_allow_list {
+            request.set_update_allow_list(list.clone(), self.options.update_allow_transitive);
+        }
+        let policy = self.create_policy(true, Some(&request));
+        let pool = set.create_pool(self.io, &mut request)?;
+        self.io.error("Updating dependencies");
+        let filter = self.filter();
+        let solver = Solver::new(&policy, &pool);
+        let (solution, rules) = match solver.solve(self.io, &request, &filter) {
+            Ok(r) => r,
+            Err(problems) => {
+                let err =
+                    "Your requirements could not be resolved to an installable set of packages.";
+                let pretty = self.report_problems(
+                    &problems,
+                    &mut set,
+                    &request,
+                    &pool,
+                    &problems.learned_pool,
+                    false,
+                )?;
+                self.io.error(err);
+                self.io.error(&pretty);
+                if !self.options.dev_mode {
+                    self.io.warning("Running update with --no-dev does not mean require-dev is ignored, it just means the packages will not be installed. If dev requirements are blocking the update you have to resolve those problems.");
+                }
+                self.repos = set.repos.drain(2..2 + remote_count).collect();
+                return Ok(ERROR_DEPENDENCY_RESOLUTION_FAILED.max(ERROR_GENERIC_FAILURE));
+            }
+        };
+        let _ = rules;
+        if self.io.verbosity >= 1 {
+            self.io.error(&format!(
+                "Analyzed {} packages to resolve dependencies",
+                pool.len()
+            ));
+            self.io.error(&format!(
+                "Analyzed {} rules to resolve dependencies",
+                solution.rule_count
+            ));
+        }
+        let mut lock_transaction = LockTransaction::new(&pool, &request, &solution)?;
+        self.repos = set.repos.drain(2..2 + remote_count).collect();
+        drop(pool);
+
+        if lock_transaction.operations.is_empty() {
+            self.io.error("Nothing to modify in lock file");
+            if self.options.minimal_update
+                && self.options.update_allow_list.is_none()
+                && self
+                    .locked()
+                    .is_some_and(|l| l.is_fresh(self.composer_json))
+            {
+                self.io.warning("The --minimal-changes option should be used with package arguments or after modifying composer.json requirements, otherwise it will likely not yield any dependency changes.");
+            }
+        }
+
+        let code = self.extract_dev_packages(
+            &mut lock_transaction,
+            platform,
+            &aliases,
+            &policy,
+            locked_packages.as_deref(),
+        )?;
+        if code != 0 {
+            return Ok(code);
+        }
+
+        let platform_reqs = extract_platform_requirements(&self.root.package.requires);
+        let platform_dev_reqs = extract_platform_requirements(&self.root.package.dev_requires);
+
+        let mut installs_updates: Vec<&Operation> = Vec::new();
+        let mut uninstalls: Vec<&Operation> = Vec::new();
+        if !lock_transaction.operations.is_empty() {
+            let mut install_names = Vec::new();
+            let mut update_names = Vec::new();
+            let mut uninstall_names = Vec::new();
+            for operation in &lock_transaction.operations {
+                match operation {
+                    Operation::Install(p) => {
+                        installs_updates.push(operation);
+                        install_names.push(format!(
+                            "{}:{}",
+                            p.pretty_name,
+                            p.full_pretty_version()
+                        ));
+                    }
+                    Operation::Update { initial, target } => {
+                        if self.options.update_mirrors
+                            && initial.name == target.name
+                            && initial.version == target.version
+                        {
+                            continue;
+                        }
+                        installs_updates.push(operation);
+                        update_names.push(format!(
+                            "{}:{}",
+                            target.pretty_name,
+                            target.full_pretty_version()
+                        ));
+                    }
+                    Operation::Uninstall(p) => {
+                        uninstalls.push(operation);
+                        uninstall_names.push(p.pretty_name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if self.config.bool("lock") {
+                self.io.error(&format!(
+                    "Lock file operations: {} install{}, {} update{}, {} removal{}",
+                    install_names.len(),
+                    plural(install_names.len()),
+                    update_names.len(),
+                    plural(update_names.len()),
+                    uninstalls.len(),
+                    plural(uninstalls.len())
+                ));
+                if self.io.verbosity >= 1 {
+                    if !install_names.is_empty() {
+                        self.io
+                            .error(&format!("Installs: {}", install_names.join(", ")));
+                    }
+                    if !update_names.is_empty() {
+                        self.io
+                            .error(&format!("Updates: {}", update_names.join(", ")));
+                    }
+                    if !uninstall_names.is_empty() {
+                        self.io
+                            .error(&format!("Removals: {}", uninstall_names.join(", ")));
+                    }
+                }
+            }
+        }
+        let by_name = |a: &&Operation, b: &&Operation| a.package().name.cmp(&b.package().name);
+        uninstalls.sort_by(by_name);
+        installs_updates.sort_by(by_name);
+        let mut suggesting = Vec::new();
+        for operation in uninstalls.iter().chain(installs_updates.iter()) {
+            if let Operation::Install(p) = operation {
+                suggesting.push(p.clone());
+            }
+            if self.config.bool("lock")
+                && (!operation.kind().contains("Alias") || self.io.verbosity >= 3)
+            {
+                self.io.error(&format!("  - {}", operation.show_with(true)));
+            }
+        }
+        self.suggesting_packages = suggesting;
+
+        let lock_data = crate::lock::build_lock_data(
+            &crate::lock::content_hash(self.composer_json)?,
+            &lock_transaction.new_lock_packages(false, self.options.update_mirrors),
+            &lock_transaction.new_lock_packages(true, self.options.update_mirrors),
+            &platform_reqs,
+            &platform_dev_reqs,
+            &lock_transaction.aliases(&aliases),
+            self.root.minimum_stability,
+            &self.root.stability_flags,
+            self.options.prefer_stable || self.root.prefer_stable,
+            self.options.prefer_lowest,
+            &crate::platform::overrides_from_config(self.config),
+        );
+        let unchanged = self.locked().is_some_and(|l| {
+            crate::lock::php_assoc(Value::Object(l.data.clone()))
+                == crate::lock::php_assoc(lock_data.clone())
+        });
+        if !unchanged {
+            let write = self.options.write_lock && self.options.execute_operations;
+            if write {
+                if let Some(path) = &self.lock_path {
+                    crate::lock::write_lock(path, &lock_data)?;
+                }
+                self.written_lock = Some(lock_data.clone());
+                self.io.error("Writing lock file");
+            }
+            self.lock = Some(Lock {
+                data: lock_data.as_object().cloned().unwrap_or_default(),
+            });
+        }
+
+        if self.options.install {
+            return self.do_install(local_repo, vendor_dir, true);
+        }
+        Ok(0)
+    }
+
+    /// `Installer::extractDevPackages`: a second solve with only the non-dev requires.
+    fn extract_dev_packages(
+        &mut self,
+        lock_transaction: &mut LockTransaction,
+        platform: &'a PlatformRepository,
+        aliases: &[AliasDef],
+        policy: &DefaultPolicy,
+        locked_packages: Option<&[Package]>,
+    ) -> Result<i32, String> {
+        if self.root.package.dev_requires.is_empty() {
+            return Ok(0);
+        }
+        let mut result_packages = Vec::new();
+        for package in lock_transaction.new_lock_packages(false, false) {
+            let dumped = crate::package::dumper::dump(&package);
+            let loaded = crate::package::load(&dumped)?;
+            if let Some(real) = &loaded.alias_of {
+                result_packages.push(loaded.clone());
+                result_packages.push((**real).clone());
+            } else {
+                result_packages.push(loaded);
+            }
+        }
+        let (mut set, fixed_root) = self.create_repository_set(true, platform, aliases, None)?;
+        set.add(Repository::Array(ArrayRepo::new(result_packages)));
+        let mut request = self.create_request(&fixed_root, platform, None);
+        self.require_packages_for_update(&mut request, locked_packages, false)?;
+        let pool = set.create_pool_with_all_packages();
+        let filter = self.filter();
+        let solver = Solver::new(policy, &pool);
+        match solver.solve(self.io, &request, &filter) {
+            Ok((solution, _)) => {
+                let non_dev = LockTransaction::new(&pool, &request, &solution)?;
+                lock_transaction.set_non_dev_packages(&non_dev);
+                Ok(0)
+            }
+            Err(problems) => {
+                let err = "Unable to find a compatible set of packages based on your non-dev requirements alone.";
+                let pretty = self.report_problems(
+                    &problems,
+                    &mut set,
+                    &request,
+                    &pool,
+                    &problems.learned_pool,
+                    true,
+                )?;
+                self.io.error(err);
+                self.io.error("Your requirements can be resolved successfully when require-dev packages are present.");
+                self.io.error("You may need to move packages from require-dev or some of their dependencies to require.");
+                self.io.error(&pretty);
+                Ok(ERROR_DEPENDENCY_RESOLUTION_FAILED)
+            }
+        }
+    }
+
     /// `Installer::doInstall`
     fn do_install(
         &mut self,
         local_repo: &mut InstalledRepository,
         vendor_dir: &str,
+        already_solved: bool,
     ) -> Result<i32, String> {
-        if self.lock.data.get("content-hash").and_then(|v| v.as_str())
-            == Some(crate::lock::CONFLICTED_CONTENT_HASH)
+        let lock = self.lock.clone().ok_or("No lock file")?;
+        if !already_solved
+            && lock.data.get("content-hash").and_then(|v| v.as_str())
+                == Some(crate::lock::CONFLICTED_CONTENT_HASH)
         {
             self.io.error(crate::lock::CONFLICTED_CONTENT_HASH);
             return Ok(ERROR_LOCK_FILE_INVALID);
@@ -239,25 +917,81 @@ impl Installer<'_> {
                 }
             ));
         }
-        let locked = self.lock.locked_packages(self.options.dev_mode)?;
+        let locked = lock.locked_packages(self.options.dev_mode)?;
 
-        self.io
-            .error("Verifying lock file contents can be installed on current platform.");
-        if !self.lock.is_fresh(self.composer_json) {
-            self.io.warning("Warning: The lock file is not up to date with the latest changes in composer.json. You may be getting outdated dependencies. It is recommended that you run `composer update` or `composer update <package name>`.");
-        }
-        let missing = self
-            .lock
-            .missing_requirement_info(self.root, self.options.dev_mode)?;
-        if !missing.is_empty() {
-            for line in &missing {
-                self.io.error(line);
+        if !already_solved {
+            self.io
+                .error("Verifying lock file contents can be installed on current platform.");
+            let platform = self.platform_repo(false)?;
+            let platform: &'a PlatformRepository = Box::leak(Box::new(platform));
+            let policy = self.create_policy(false, None);
+            let (mut set, fixed_root) =
+                self.create_repository_set(false, platform, &[], Some(&locked))?;
+            let locked_index = set.add(Repository::Locked(locked.clone()));
+            let mut request =
+                self.create_request(&fixed_root, platform, Some((locked_index, locked.clone())));
+
+            if !lock.is_fresh(self.composer_json) {
+                self.io.warning("Warning: The lock file is not up to date with the latest changes in composer.json. You may be getting outdated dependencies. It is recommended that you run `composer update` or `composer update <package name>`.");
             }
-            if !self.config.bool("allow-missing-requirements") {
-                return Ok(ERROR_LOCK_FILE_INVALID);
+            let missing = lock.missing_requirement_info(self.root, self.options.dev_mode)?;
+            if !missing.is_empty() {
+                for line in &missing {
+                    self.io.error(line);
+                }
+                if !self.config.bool("allow-missing-requirements") {
+                    return Ok(ERROR_LOCK_FILE_INVALID);
+                }
+            }
+            for package in &locked {
+                request.fix_locked_package(locked_index, package);
+            }
+            let mut root_requires: Vec<&crate::package::Link> =
+                self.root.package.requires.iter().collect();
+            if self.options.dev_mode {
+                root_requires.extend(self.root.package.dev_requires.iter());
+            }
+            for link in &root_requires {
+                if crate::package::is_platform_package(&link.target) {
+                    request.require_name(
+                        &link.target,
+                        link.constraint.clone(),
+                        &link.pretty_constraint,
+                    )?;
+                }
+            }
+            for (name, constraint, pretty) in lock.platform_requirements(self.options.dev_mode) {
+                if !root_requires.iter().any(|l| l.target == name) {
+                    request.require_name(&name, constraint, &pretty)?;
+                }
+            }
+            let pool = set.create_pool(self.io, &mut request)?;
+            let filter = self.filter();
+            let solver = Solver::new(&policy, &pool);
+            match solver.solve(self.io, &request, &filter) {
+                Ok((solution, _)) => {
+                    let transaction = LockTransaction::new(&pool, &request, &solution)?;
+                    if !transaction.operations.is_empty() {
+                        self.io.error("Your lock file cannot be installed on this system without changes. Please run composer update.");
+                        return Ok(ERROR_LOCK_FILE_INVALID);
+                    }
+                }
+                Err(problems) => {
+                    let err = "Your lock file does not contain a compatible set of packages. Please run composer update.";
+                    let pretty = self.report_problems(
+                        &problems,
+                        &mut set,
+                        &request,
+                        &pool,
+                        &problems.learned_pool,
+                        false,
+                    )?;
+                    self.io.error(err);
+                    self.io.error(&pretty);
+                    return Ok(ERROR_DEPENDENCY_RESOLUTION_FAILED.max(ERROR_GENERIC_FAILURE));
+                }
             }
         }
-        // ponytail: no platform/solver verification of the lock yet (tickets 07 and 10)
 
         let operations = calculate_operations(&local_repo.packages, &locked)?;
         let mut installs = Vec::new();
@@ -280,7 +1014,6 @@ impl Installer<'_> {
         if installs.is_empty() && updates.is_empty() && uninstalls.is_empty() {
             self.io.error("Nothing to install, update or remove");
         } else {
-            let plural = |n: usize| if n == 1 { "" } else { "s" };
             self.io.error(&format!(
                 "Package operations: {} install{}, {} update{}, {} removal{}",
                 installs.len(),
@@ -290,7 +1023,7 @@ impl Installer<'_> {
                 uninstalls.len(),
                 plural(uninstalls.len())
             ));
-            if self.options.verbose {
+            if self.io.verbosity >= 1 {
                 if !installs.is_empty() {
                     self.io.error(&format!("Installs: {}", installs.join(", ")));
                 }
@@ -304,7 +1037,7 @@ impl Installer<'_> {
             }
         }
 
-        if self.options.dry_run {
+        if !self.options.execute_operations {
             for op in &operations {
                 if !op.kind().contains("Alias") || self.io.verbosity >= 3 {
                     self.io.error(&format!("  - {}", op.show()));
@@ -313,7 +1046,7 @@ impl Installer<'_> {
             return Ok(0);
         }
 
-        local_repo.dev_package_names = self.lock.dev_package_names();
+        local_repo.dev_package_names = lock.dev_package_names();
         self.executor.execute(
             self.io,
             self.config,
@@ -331,6 +1064,27 @@ impl Installer<'_> {
         }
         Ok(0)
     }
+}
+
+/// minimum stability, stability flags, root requires
+type SetInputs = (
+    Stability,
+    BTreeMap<String, u8>,
+    Vec<(String, Constraint, String)>,
+);
+
+/// `Installer::extractPlatformRequirements`
+fn extract_platform_requirements(links: &[crate::package::Link]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for link in links {
+        if crate::package::is_platform_package(&link.target) {
+            match out.iter_mut().find(|(n, _)| *n == link.target) {
+                Some(entry) => entry.1 = link.pretty_constraint.clone(),
+                None => out.push((link.target.clone(), link.pretty_constraint.clone())),
+            }
+        }
+    }
+    out
 }
 
 /// The real `InstallationManager`: downloads, store or archive extraction, binaries, installed.json.

@@ -12,7 +12,8 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 
 | Metric | Value |
 |---|---|
-| Composer installer fixtures passing | 13/228 (every install-from-lock fixture; the rest need the resolver, slice 2) |
+| Composer installer fixtures passing | 194/228 (the rest need dependency policies, path repositories or a composer repository served from a directory) |
+| `update` lock vs composer | byte-identical on a live monolog + symfony/console + phpunit project (full, `--no-dev`, `--prefer-lowest`, `--lock`, partial) |
 | `show` / `search` golden cases vs composer | 31 on a recorded Packagist + live `show symfony/console -a --format=json` |
 | `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
 

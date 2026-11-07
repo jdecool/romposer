@@ -115,6 +115,8 @@ pub struct Package {
     pub transport_options: Option<Value>,
     /// The real package when this is a branch alias of it.
     pub alias_of: Option<Box<Package>>,
+    /// `AliasPackage::isRootPackageAlias`
+    pub root_alias: bool,
 }
 
 impl Package {
@@ -158,6 +160,7 @@ impl Package {
             scripts: Map::new(),
             transport_options: None,
             alias_of: None,
+            root_alias: false,
         }
     }
 
@@ -167,6 +170,30 @@ impl Package {
 
     pub fn stability(&self) -> semver::Stability {
         semver::parse_stability(&self.version)
+    }
+
+    /// `getFullPrettyVersion(true, DISPLAY_SOURCE_REF)`: the source reference even for tagged versions.
+    pub fn full_pretty_version_ref(&self) -> String {
+        let source_type = self.source.as_ref().map(|s| s.kind.as_str()).unwrap_or("");
+        let Some(reference) = self.source.as_ref().and_then(|s| s.reference.as_deref()) else {
+            return self.pretty_version.clone();
+        };
+        if reference.len() == 40 && source_type != "svn" {
+            return format!("{} {}", self.pretty_version, &reference[..7]);
+        }
+        format!("{} {}", self.pretty_version, reference)
+    }
+
+    /// `getFullPrettyVersion(true, DISPLAY_DIST_REF)`
+    pub fn full_pretty_version_dist_ref(&self) -> String {
+        let source_type = self.source.as_ref().map(|s| s.kind.as_str()).unwrap_or("");
+        let Some(reference) = self.dist.as_ref().and_then(|d| d.reference.as_deref()) else {
+            return self.pretty_version.clone();
+        };
+        if reference.len() == 40 && source_type != "svn" {
+            return format!("{} {}", self.pretty_version, &reference[..7]);
+        }
+        format!("{} {}", self.pretty_version, reference)
     }
 
     /// `BasePackage::getFullPrettyVersion` in its default display mode.

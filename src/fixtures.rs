@@ -10,6 +10,8 @@ use crate::json::{Map, Value, encode_compact};
 use crate::lock::{Lock, php_assoc};
 use crate::package::root::load_root;
 use crate::package::{self, dumper};
+use crate::platform::PhpInfo;
+use crate::solver::builder::{ArrayRepo, Repository};
 use crate::transaction::Operation;
 use regex::Regex;
 use std::collections::BTreeMap;
@@ -237,12 +239,18 @@ fn dumped_installed(repo: &InstalledRepository) -> Value {
         .iter()
         .map(|p| {
             let mut d = dumper::dump(p);
-            d.remove("version_normalized");
+            d.shift_remove("version_normalized");
             d
         })
         .collect();
     packages.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Value::Array(packages.into_iter().map(Value::Object).collect())
+}
+
+/// The running PHP, probed once for every fixture.
+fn php_info() -> Option<&'static PhpInfo> {
+    static PHP: std::sync::OnceLock<Option<PhpInfo>> = std::sync::OnceLock::new();
+    PHP.get_or_init(PhpInfo::detect).as_ref()
 }
 
 /// Runs one fixture in memory and compares it with its expectations.
@@ -251,21 +259,85 @@ pub fn run(fixture: &Fixture) -> Outcome {
         passed: false,
         detail,
     };
+    let mut env_guard: Option<String> = None;
     if let Some(cond) = &fixture.condition {
-        return fail(format!("condition not evaluated: {cond}"));
+        let putenv = Regex::new(r"^putenv\('([A-Z_]+)=([^']*)'\)$").unwrap();
+        if let Some(m) = putenv.captures(cond.trim()) {
+            // SAFETY: fixtures run one at a time on this thread; the variable is reset below
+            unsafe { std::env::set_var(&m[1], &m[2]) };
+            env_guard = Some(m[1].to_string());
+        } else if cond.trim() != "!defined('HHVM_VERSION')" {
+            return fail(format!("condition not evaluated: {cond}"));
+        }
     }
+    let outcome = run_inner(fixture);
+    if let Some(name) = env_guard {
+        // SAFETY: see above
+        unsafe { std::env::remove_var(name) };
+    }
+    outcome
+}
+
+fn run_inner(fixture: &Fixture) -> Outcome {
+    let fail = |detail: String| Outcome {
+        passed: false,
+        detail,
+    };
     let Some(manifest) = fixture.composer.as_object() else {
         return fail("--COMPOSER-- is not an object".into());
     };
-    // repositories: only inline `package` repositories exist in memory for now
-    if let Some(Value::Array(repos)) = manifest.get("repositories") {
-        for repo in repos {
+    // repositories: inline `package` repositories become array repositories
+    let mut package_repos: Vec<ArrayRepo> = Vec::new();
+    let repo_list: Vec<&Value> = match manifest.get("repositories") {
+        Some(Value::Array(repos)) => repos.iter().collect(),
+        Some(Value::Object(repos)) => repos.values().collect(),
+        _ => vec![],
+    };
+    {
+        for repo in repo_list {
             if repo.get("type").and_then(Value::as_str) != Some("package") {
                 return fail(format!(
                     "repository type {:?} is not supported in the fixture runner",
                     repo.get("type")
                 ));
             }
+            let defs: Vec<&Value> = match repo.get("package") {
+                Some(Value::Array(list)) => list.iter().collect(),
+                Some(single @ Value::Object(_)) => vec![single],
+                _ => vec![],
+            };
+            let mut packages = Vec::new();
+            for def in defs {
+                let Some(obj) = def.as_object() else { continue };
+                match package::load(obj) {
+                    Ok(p) => {
+                        let real = p.alias_of.clone();
+                        packages.push(p);
+                        if let Some(real) = real {
+                            packages.push(*real);
+                        }
+                    }
+                    Err(e) => return exception_outcome(fixture, &e),
+                }
+            }
+            let patterns = |key: &str| -> Option<regex::Regex> {
+                match repo.get(key) {
+                    Some(Value::Array(list)) => Some(crate::repository::package_names_to_regexp(
+                        &list
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                }
+            };
+            package_repos.push(ArrayRepo {
+                packages,
+                canonical: repo.get("canonical") != Some(&Value::Bool(false)),
+                only: patterns("only"),
+                exclude: patterns("exclude"),
+            });
         }
     }
 
@@ -277,12 +349,6 @@ pub fn run(fixture: &Fixture) -> Outcome {
     if command != "install" && command != "update" {
         return fail("The run command only supports install and update".into());
     }
-    if command == "update" || fixture.lock.is_none() {
-        return fail("update (dependency resolution) is not implemented yet".into());
-    }
-    if fixture.expect_lock.is_some() {
-        return fail("lock writing is not implemented yet".into());
-    }
 
     let root = match load_root(manifest) {
         Ok(r) => r,
@@ -290,10 +356,11 @@ pub fn run(fixture: &Fixture) -> Outcome {
     };
     let mut config = Config::in_memory();
     config.merge(manifest);
-    let lock = match fixture.lock.as_ref().and_then(Value::as_object) {
-        Some(l) => Lock { data: l.clone() },
-        None => return fail("install without lock needs the solver".into()),
-    };
+    let lock = fixture
+        .lock
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|l| Lock { data: l.clone() });
     let mut local_repo = InstalledRepository::default();
     if let Some(Value::Array(installed)) = &fixture.installed {
         for entry in installed {
@@ -309,36 +376,67 @@ pub fn run(fixture: &Fixture) -> Outcome {
     let contents = encode_compact(&fixture.composer);
     let mut io = Io::buffered();
     let mut executor = TraceExecutor::default();
-    let options = Options {
-        dev_mode: !flags.contains(&"--no-dev"),
-        dry_run: flags.contains(&"--dry-run"),
-        download_only: false,
-        prefer_source: false,
-        prefer_dist: false,
-        dump_autoloader: !flags.contains(&"--dry-run"),
-        optimize_autoloader: false,
-        classmap_authoritative: false,
-        apcu_autoloader: false,
-        apcu_autoloader_prefix: None,
-        run_scripts: false,
-        verbose: flags.contains(&"--dry-run"),
-        strict_psr_autoloader: false,
-        ignore_all_platform_reqs: flags.contains(&"--ignore-platform-reqs"),
-        ignored_platform_reqs: flags
+    let has = |flag: &str| flags.contains(&flag);
+    let mut options = Options::defaults();
+    options.write_lock = config.bool("lock");
+    options.dev_mode = !has("--no-dev");
+    options.dry_run = has("--dry-run");
+    options.ignore_all_platform_reqs = has("--ignore-platform-reqs");
+    options.ignored_platform_reqs = flags
+        .iter()
+        .filter_map(|f| f.strip_prefix("--ignore-platform-req=").map(str::to_string))
+        .collect();
+    if command == "update" {
+        let packages: Vec<String> = flags
             .iter()
-            .filter_map(|f| f.strip_prefix("--ignore-platform-req=").map(str::to_string))
-            .collect(),
-    };
+            .filter(|f| !f.starts_with('-'))
+            .map(|f| f.to_string())
+            .collect();
+        let filtered: Vec<String> = packages
+            .iter()
+            .filter(|p| !matches!(p.as_str(), "lock" | "nothing" | "mirrors"))
+            .cloned()
+            .collect();
+        options.update = true;
+        options.install = !has("--no-install");
+        options.update_mirrors = has("--lock") || filtered.len() != packages.len();
+        options.update_allow_list = (!filtered.is_empty()).then(|| {
+            let mut list: Vec<String> = Vec::new();
+            for p in filtered.iter().map(|p| p.to_lowercase()) {
+                if !list.contains(&p) {
+                    list.push(p);
+                }
+            }
+            list
+        });
+        options.update_allow_transitive = if has("--with-all-dependencies") {
+            crate::solver::UPDATE_LISTED_WITH_TRANSITIVE_DEPS
+        } else if has("--with-dependencies") {
+            crate::solver::UPDATE_LISTED_WITH_TRANSITIVE_DEPS_NO_ROOT_REQUIRE
+        } else {
+            crate::solver::UPDATE_ONLY_LISTED
+        };
+        options.prefer_stable = has("--prefer-stable");
+        options.prefer_lowest = has("--prefer-lowest");
+        options.minimal_update = has("--minimal-changes");
+    }
+    let repos: Vec<Repository> = package_repos.into_iter().map(Repository::Array).collect();
     let mut installer = Installer {
         io: &mut io,
         config: &config,
         root: &root,
-        lock: &lock,
+        lock,
+        lock_path: None,
         composer_json: &contents,
         options,
         executor: &mut executor,
+        repos,
+        php: php_info().cloned(),
+        written_lock: None,
+        suggesting_packages: vec![],
     };
     let result = installer.run_with(&mut local_repo);
+    let written_lock = installer.written_lock.take();
     let output = io.output();
 
     // the console application turns an exception into exit code 1 and prints it
@@ -357,6 +455,32 @@ pub fn run(fixture: &Fixture) -> Outcome {
             "exit code {code}, expected {}\n{output}",
             fixture.expect_exit_code
         ));
+    }
+    if fixture.expect_lock_never_written && written_lock.is_some() {
+        return fail(format!(
+            "the lock file was written but --EXPECT-LOCK-- is false\n{output}"
+        ));
+    }
+    if let Some(expected) = &fixture.expect_lock {
+        let Some(actual) = written_lock else {
+            return fail(format!("the lock file was not written\n{output}"));
+        };
+        let strip = |v: &Value| -> Value {
+            let mut v = v.clone();
+            if let Some(o) = v.as_object_mut() {
+                for key in ["hash", "content-hash", "_readme", "plugin-api-version"] {
+                    o.remove(key);
+                }
+            }
+            php_assoc(v)
+        };
+        if strip(expected) != strip(&actual) {
+            return fail(format!(
+                "lock differs\n--- expected\n{}\n--- actual\n{}\n--- output\n{output}",
+                crate::json::encode_pretty(&strip(expected)),
+                crate::json::encode_pretty(&strip(&actual))
+            ));
+        }
     }
     if let Some(expected) = &fixture.expect_installed {
         let actual = php_assoc(dumped_installed(&local_repo));

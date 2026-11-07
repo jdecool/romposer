@@ -1,12 +1,11 @@
 //! `romposer install`, a port of `InstallCommand` for projects with a lock file.
 
-use crate::config::{self, Config};
+use crate::commands::dump_autoload::load_project;
+use crate::config;
 use crate::installer::{Installer, Options};
 use crate::io::Io;
-use crate::json::Value;
-use crate::lock::Lock;
-use crate::package::root::load_root;
-use crate::schema;
+use crate::platform::PhpInfo;
+use crate::solver::builder::Repository;
 
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
@@ -100,95 +99,51 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         return Ok(1);
     }
 
-    let file = config::composer_file()?;
-    let cwd = crate::fs::cwd();
-    if !file.exists() {
-        let message = if file.to_string_lossy() == "./composer.json"
-            || file.to_string_lossy() == "composer.json"
-        {
-            format!("Composer could not find a composer.json file in {cwd}")
-        } else {
-            format!(
-                "Composer could not find the config file: {}",
-                file.display()
-            )
-        };
-        return Err(format!(
-            "{message}\nTo initialize a project, please create a composer.json file. See https://getcomposer.org/basic-usage"
-        ));
-    }
-    let contents = std::fs::read_to_string(&file)
-        .map_err(|e| format!("Could not read {}\n\n{e}", file.display()))?;
-    let manifest: Value = serde_json::from_str(&contents)
-        .map_err(|e| format!("\"{}\" does not contain valid JSON\n{e}", file.display()))?;
-    if let Err(errors) = schema::validate(&manifest, false) {
-        return Err(format!(
-            "\"{}\" does not match the expected JSON schema:\n - {}",
-            file.display(),
-            errors.join("\n - ")
-        ));
-    }
-    let manifest_obj = manifest.as_object().cloned().unwrap_or_default();
-    let root = load_root(&manifest_obj)?;
-    let config = Config::for_project(&cwd, &manifest_obj, &file)?;
-
-    let lock_path = config::lock_file(&file);
-    let lock = if config.bool("lock") {
-        Lock::read(&lock_path)?
-    } else {
-        if lock_path.exists() {
-            io.error(&format!(
-                "{} is present but ignored as the \"lock\" config option is disabled.",
-                lock_path.display()
-            ));
-        }
-        None
-    };
-    let Some(lock) = lock.filter(Lock::is_locked) else {
-        let message = "Updating dependencies to latest instead of installing from lock file. See https://getcomposer.org/install for more information.";
-        if !config.bool("lock") {
-            io.error(&format!(
-                "Lockfile creation is disabled in config. {message}"
-            ));
-        } else {
-            io.error(&format!("No composer.lock file present. {message}"));
-        }
-        return Err("romposer slice 1 installs from an existing composer.lock only; `update` arrives with slice 2".into());
-    };
-
+    let (file, contents, root, config, lock) = load_project(io)?;
     let dev_mode = !args.no_dev;
     let mut executor = crate::installer::FilesystemExecutor;
+    let http = std::rc::Rc::new(crate::download::Http::new(&config)?);
+    let mut composer_repos = crate::repository::from_config(&config, http)?;
+    let repos: Vec<Repository> = composer_repos
+        .iter_mut()
+        .map(Repository::Composer)
+        .collect();
+    let mut options = Options::defaults();
+    options.dev_mode = dev_mode;
+    options.dry_run = args.dry_run;
+    options.download_only = args.download_only;
+    options.prefer_source = args.prefer_source || args.prefer_install.as_deref() == Some("source");
+    options.prefer_dist = args.prefer_dist || args.prefer_install.as_deref() == Some("dist");
+    options.dump_autoloader = !args.no_autoloader;
+    options.optimize_autoloader = args.optimize_autoloader
+        || args.classmap_authoritative
+        || config.bool("optimize-autoloader")
+        || config.bool("classmap-authoritative");
+    options.classmap_authoritative =
+        args.classmap_authoritative || config.bool("classmap-authoritative");
+    options.apcu_autoloader = args.apcu_autoloader
+        || args.apcu_autoloader_prefix.is_some()
+        || config.bool("apcu-autoloader");
+    options.apcu_autoloader_prefix = args.apcu_autoloader_prefix.clone();
+    options.run_scripts = !args.no_scripts;
+    options.strict_psr_autoloader =
+        args.strict_psr_autoloader || config.bool("strict-psr-autoloader");
+    options.ignore_all_platform_reqs = args.ignore_platform_reqs;
+    options.ignored_platform_reqs = args.ignore_platform_req.clone();
+    options.write_lock = config.bool("lock");
     let mut installer = Installer {
         io,
         config: &config,
         root: &root,
-        lock: &lock,
+        lock,
+        lock_path: Some(config::lock_file(&file)),
         composer_json: &contents,
-        options: Options {
-            dev_mode,
-            dry_run: args.dry_run,
-            download_only: args.download_only,
-            prefer_source: args.prefer_source || args.prefer_install.as_deref() == Some("source"),
-            prefer_dist: args.prefer_dist || args.prefer_install.as_deref() == Some("dist"),
-            dump_autoloader: !args.no_autoloader && !args.dry_run && !args.download_only,
-            optimize_autoloader: args.optimize_autoloader
-                || args.classmap_authoritative
-                || config.bool("optimize-autoloader")
-                || config.bool("classmap-authoritative"),
-            classmap_authoritative: args.classmap_authoritative
-                || config.bool("classmap-authoritative"),
-            apcu_autoloader: args.apcu_autoloader
-                || args.apcu_autoloader_prefix.is_some()
-                || config.bool("apcu-autoloader"),
-            apcu_autoloader_prefix: args.apcu_autoloader_prefix.clone(),
-            run_scripts: !args.no_scripts,
-            verbose: args.dry_run,
-            strict_psr_autoloader: args.strict_psr_autoloader
-                || config.bool("strict-psr-autoloader"),
-            ignore_all_platform_reqs: args.ignore_platform_reqs,
-            ignored_platform_reqs: args.ignore_platform_req.clone(),
-        },
+        options,
         executor: &mut executor,
+        repos,
+        php: PhpInfo::detect(),
+        written_lock: None,
+        suggesting_packages: vec![],
     };
     installer.run()
 }

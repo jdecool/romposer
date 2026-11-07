@@ -11,9 +11,9 @@ use crate::download::{Http, sanitize_url};
 use crate::io::Io;
 use crate::json::{Map, Value, encode};
 use crate::package::{self, Package, is_platform_package};
-use crate::semver::{Constraint, version_parser};
+use crate::semver::{Constraint, Stability, version_parser};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -624,6 +624,8 @@ impl ComposerRepository {
         }
         let mut package = package::load(&data)
             .map_err(|e| format!("Could not load packages in {}: {e}", self.name))?;
+        // `configureCachedLinks`: recursive links are not supported
+        drop_self_links(&mut package);
         if !root.dist_mirrors.is_empty() {
             let mirrors = Some(Value::Array(root.dist_mirrors.clone()));
             if let Some(dist) = &mut package.dist {
@@ -638,11 +640,13 @@ impl ComposerRepository {
         Ok(package)
     }
 
-    /// `isVersionAcceptable` without stability filtering (every stability is loaded).
-    fn version_acceptable(constraint: Option<&Constraint>, data: &Map<String, Value>) -> bool {
-        let Some(constraint) = constraint else {
-            return true;
-        };
+    /// `isVersionAcceptable`
+    fn version_acceptable(
+        constraint: Option<&Constraint>,
+        name: &str,
+        data: &Map<String, Value>,
+        stability: Option<(&[Stability], &BTreeMap<String, u8>)>,
+    ) -> bool {
         let mut versions = vec![
             data.get("version_normalized")
                 .and_then(Value::as_str)
@@ -652,22 +656,53 @@ impl ComposerRepository {
         if let Ok(Some(alias)) = package::branch_alias(data) {
             versions.push(alias);
         }
-        versions
-            .iter()
-            .any(|v| constraint.matches(&Constraint::new("==", v)))
+        versions.iter().any(|v| {
+            if let Some((acceptable, flags)) = stability
+                && !crate::solver::is_package_acceptable(
+                    acceptable,
+                    flags,
+                    &[name.to_string()],
+                    crate::semver::parse_stability(v),
+                )
+            {
+                return false;
+            }
+            constraint.is_none_or(|c| c.matches(&Constraint::new("==", v)))
+        })
     }
 
-    /// `loadPackages` for the v2 protocol, `findPackages` for static repositories:
-    /// every version of each name (aliases included) matching its constraint.
+    /// `findPackages`: every version of each name (aliases included) matching its constraint.
     pub fn load_packages(
         &mut self,
         io: &mut Io,
         names: &[(String, Option<Constraint>)],
     ) -> Result<Vec<Package>, String> {
+        let all = [
+            Stability::Stable,
+            Stability::RC,
+            Stability::Beta,
+            Stability::Alpha,
+            Stability::Dev,
+        ];
+        self.load_packages_filtered(io, names, &all, &BTreeMap::new(), &HashMap::new())
+            .map(|(_, p)| p)
+    }
+
+    /// `loadPackages`: (names found, packages) for the v2 protocol or a static repository.
+    pub fn load_packages_filtered(
+        &mut self,
+        io: &mut Io,
+        names: &[(String, Option<Constraint>)],
+        acceptable: &[Stability],
+        flags: &BTreeMap<String, u8>,
+        already_loaded: &HashMap<String, HashSet<String>>,
+    ) -> Result<(Vec<String>, Vec<Package>), String> {
         self.load_root(io, None)?;
         let root = self.root.as_ref().unwrap();
         let mut packages = Vec::new();
+        let mut found: Vec<String> = Vec::new();
         if root.metadata_url.is_none() {
+            // ArrayRepository::loadPackages over the inline packages
             let inline = root.inline.clone();
             for data in inline {
                 let name = data
@@ -681,15 +716,40 @@ impl ComposerRepository {
                 if !self.is_allowed(&name) {
                     continue;
                 }
+                if !found.contains(&name) {
+                    found.push(name.clone());
+                }
                 let mut data = data;
                 normalize_version(&mut data)?;
-                if Self::version_acceptable(constraint.as_ref(), &data) {
-                    push_with_alias_of(&mut packages, self.create_package(data)?);
+                let version = data
+                    .get("version_normalized")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if already_loaded
+                    .get(&name)
+                    .is_some_and(|v| v.contains(&version))
+                {
+                    continue;
+                }
+                let package = self.create_package(data)?;
+                if constraint
+                    .as_ref()
+                    .is_none_or(|c| c.matches(&Constraint::new("==", &package.version)))
+                    && crate::solver::is_package_acceptable(
+                        acceptable,
+                        flags,
+                        &crate::solver::names(&package, true),
+                        package.stability(),
+                    )
+                {
+                    push_with_alias_of(&mut packages, package);
                 }
             }
-            return Ok(packages);
+            return Ok((found, packages));
         }
         let metadata_url = root.metadata_url.clone().unwrap();
+        let only_dev = acceptable == [Stability::Dev] && flags.is_empty();
         let mut jobs: Vec<(String, String, Option<Constraint>)> = Vec::new();
         for (name, constraint) in names {
             let name = name.to_lowercase();
@@ -699,8 +759,16 @@ impl ComposerRepository {
             if self.has_available_list() && !self.contains(&name) {
                 continue;
             }
-            for file in [name.clone(), format!("{name}~dev")] {
-                jobs.push((file, name.clone(), constraint.clone()));
+            if !only_dev {
+                jobs.push((name.clone(), name.clone(), constraint.clone()));
+            }
+            if crate::solver::is_package_acceptable(
+                acceptable,
+                flags,
+                std::slice::from_ref(&name),
+                Stability::Dev,
+            ) {
+                jobs.push((format!("{name}~dev"), name.clone(), constraint.clone()));
             }
         }
         // partial packages inlined in packages.json win over the lazy files
@@ -804,6 +872,9 @@ impl ComposerRepository {
             else {
                 continue;
             };
+            if !found.contains(&real_name) {
+                found.push(real_name.clone());
+            }
             let versions = if data.get("minified") == Some(&Value::String("composer/2.0".into())) {
                 expand_minified(versions)
             } else {
@@ -814,12 +885,28 @@ impl ComposerRepository {
             };
             for mut version in versions {
                 normalize_version(&mut version)?;
-                if Self::version_acceptable(constraint.as_ref(), &version) {
+                let normalized = version
+                    .get("version_normalized")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if already_loaded
+                    .get(&real_name)
+                    .is_some_and(|v| v.contains(&normalized))
+                {
+                    continue;
+                }
+                if Self::version_acceptable(
+                    constraint.as_ref(),
+                    &real_name,
+                    &version,
+                    Some((acceptable, flags)),
+                ) {
                     push_with_alias_of(&mut packages, self.create_package(version)?);
                 }
             }
         }
-        Ok(packages)
+        Ok((found, packages))
     }
 
     /// `getPackageNames`
@@ -1029,6 +1116,23 @@ impl ComposerRepository {
     /// finite): v2 repositories without a list fall back to an empty listing.
     pub fn is_lazy(&self) -> bool {
         self.root.as_ref().is_some_and(|r| r.metadata_url.is_some())
+    }
+}
+
+/// `ArrayLoader::configureCachedLinks` skips links a package declares on its own name.
+fn drop_self_links(package: &mut Package) {
+    let name = package.name.clone();
+    for links in [
+        &mut package.requires,
+        &mut package.dev_requires,
+        &mut package.conflicts,
+        &mut package.provides,
+        &mut package.replaces,
+    ] {
+        links.retain(|l| l.target != name);
+    }
+    if let Some(real) = &mut package.alias_of {
+        drop_self_links(real);
     }
 }
 
