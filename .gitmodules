@@ -1,0 +1,3 @@
+[submodule "reference/composer"]
+	path = reference/composer
+	url = https://github.com/composer/composer.git
