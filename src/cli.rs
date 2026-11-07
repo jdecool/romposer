@@ -49,6 +49,9 @@ enum Command {
     /// Dumps the autoloader.
     #[command(name = "dump-autoload", visible_aliases = ["dumpautoload", "dump"])]
     DumpAutoload(commands::dump_autoload::Args),
+    /// Inspect and maintain the shared package store
+    #[command(subcommand)]
+    Store(commands::store::Command),
 }
 
 /// Runs the CLI and returns the process exit code.
@@ -72,6 +75,7 @@ pub fn run() -> i32 {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
         Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
+        Some(Command::Store(command)) => commands::store::run(&command, &mut io),
         None => {
             println!("{VERSION_LINE}");
             0

@@ -13,18 +13,43 @@ use std::fmt::Write;
 const INDENT: &str = "    ";
 
 pub fn encode_pretty(value: &Value) -> String {
-    let mut out = String::new();
-    write_value(&mut out, value, true, 0);
-    out
+    encode(value, true, true, true)
 }
 
 pub fn encode_compact(value: &Value) -> String {
+    encode(value, false, false, false)
+}
+
+/// `json_encode` with any combination of `JSON_PRETTY_PRINT`, `JSON_UNESCAPED_SLASHES`
+/// and `JSON_UNESCAPED_UNICODE`.
+pub fn encode(
+    value: &Value,
+    pretty: bool,
+    unescaped_slashes: bool,
+    unescaped_unicode: bool,
+) -> String {
     let mut out = String::new();
-    write_value(&mut out, value, false, 0);
+    write_value(
+        &mut out,
+        value,
+        &Flags {
+            pretty,
+            unescaped_slashes,
+            unescaped_unicode,
+        },
+        0,
+    );
     out
 }
 
-fn write_value(out: &mut String, value: &Value, pretty: bool, depth: usize) {
+struct Flags {
+    pretty: bool,
+    unescaped_slashes: bool,
+    unescaped_unicode: bool,
+}
+
+fn write_value(out: &mut String, value: &Value, flags: &Flags, depth: usize) {
+    let pretty = flags.pretty;
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -36,7 +61,7 @@ fn write_value(out: &mut String, value: &Value, pretty: bool, depth: usize) {
                 out.push_str(&n.to_string());
             }
         }
-        Value::String(s) => write_string(out, s, pretty),
+        Value::String(s) => write_string(out, s, flags),
         Value::Array(items) => {
             if items.is_empty() {
                 out.push_str("[]");
@@ -48,7 +73,7 @@ fn write_value(out: &mut String, value: &Value, pretty: bool, depth: usize) {
                     out.push(',');
                 }
                 newline(out, pretty, depth + 1);
-                write_value(out, item, pretty, depth + 1);
+                write_value(out, item, flags, depth + 1);
             }
             newline(out, pretty, depth);
             out.push(']');
@@ -64,12 +89,12 @@ fn write_value(out: &mut String, value: &Value, pretty: bool, depth: usize) {
                     out.push(',');
                 }
                 newline(out, pretty, depth + 1);
-                write_string(out, k, pretty);
+                write_string(out, k, flags);
                 out.push(':');
                 if pretty {
                     out.push(' ');
                 }
-                write_value(out, v, pretty, depth + 1);
+                write_value(out, v, flags, depth + 1);
             }
             newline(out, pretty, depth);
             out.push('}');
@@ -86,13 +111,13 @@ fn newline(out: &mut String, pretty: bool, depth: usize) {
     }
 }
 
-fn write_string(out: &mut String, s: &str, unescaped: bool) {
+fn write_string(out: &mut String, s: &str, flags: &Flags) {
     out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '/' if !unescaped => out.push_str("\\/"),
+            '/' if !flags.unescaped_slashes => out.push_str("\\/"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
@@ -101,7 +126,7 @@ fn write_string(out: &mut String, s: &str, unescaped: bool) {
             c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
             // PHP keeps escaping the line terminators even with JSON_UNESCAPED_UNICODE
             '\u{2028}' | '\u{2029}' => write!(out, "\\u{:04x}", c as u32).unwrap(),
-            c if unescaped || c.is_ascii() => out.push(c),
+            c if flags.unescaped_unicode || c.is_ascii() => out.push(c),
             c => {
                 let mut buf = [0u16; 2];
                 for unit in c.encode_utf16(&mut buf) {

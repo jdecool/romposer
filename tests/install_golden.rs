@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{composer, romposer, run, temp_dir};
+use common::{composer, romposer, run, run_env, temp_dir};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -79,10 +79,12 @@ fn install_from_lock_matches_composer() {
         "composer install failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = run(
+    // the plain path: store disabled, same vendor/ as Composer down to the modes
+    let out = run_env(
         &romposer(),
         &ours,
         &["install", "--no-scripts", "--no-plugins"],
+        &[("PCOMPOSER_DISABLE", "1")],
     );
     assert!(
         out.status.success(),
@@ -124,7 +126,12 @@ fn install_from_lock_matches_composer() {
     );
 
     // a second install is a no-op for both, and --no-dev drops the dev package
-    let out = run(&romposer(), &ours, &["install", "--no-dev"]);
+    let out = run_env(
+        &romposer(),
+        &ours,
+        &["install", "--no-dev"],
+        &[("PCOMPOSER_DISABLE", "1")],
+    );
     assert!(
         out.status.success(),
         "{}",

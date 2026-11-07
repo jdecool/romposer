@@ -24,14 +24,24 @@ pub fn composer() -> Option<PathBuf> {
 }
 
 pub fn run(bin: &Path, dir: &Path, args: &[&str]) -> Output {
-    Command::new(bin)
-        .args(args)
+    run_env(bin, dir, args, &[])
+}
+
+/// Runs with an isolated COMPOSER_HOME (and so cache and store) under `dir`.
+pub fn run_env(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .current_dir(dir)
         .env("COMPOSER_HOME", dir.join(".composer-home"))
         .env("COMPOSER_NO_INTERACTION", "1")
         .env_remove("COMPOSER")
-        .output()
-        .expect("spawn")
+        .env_remove("PCOMPOSER_DISABLE")
+        .env_remove("PCOMPOSER_STRATEGY")
+        .env_remove("PCOMPOSER_STORE");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn")
 }
 
 pub fn temp_dir(name: &str) -> PathBuf {

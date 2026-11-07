@@ -264,7 +264,7 @@ pub fn dump(
             .and_then(Value::as_str);
         match hash {
             Some(h) if Regex::new(r"^[a-f0-9]+$").unwrap().is_match(h) => h.to_string(),
-            _ => random_hex(32),
+            _ => crate::fs::random_hex(16),
         }
     });
 
@@ -398,21 +398,6 @@ fn write_if_modified(path: &str, content: &str) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| format!("Could not write {path}: {e}"))?;
     }
     Ok(())
-}
-
-fn random_hex(len: usize) -> String {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut x = seed ^ (u128::from(std::process::id()) << 64) | 1;
-    let mut out = String::new();
-    while out.len() < len {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.push_str(&format!("{:x}", x & 0xf));
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,7 +1031,7 @@ fn autoload_real_file(
         let prefix = options
             .apcu_prefix
             .clone()
-            .unwrap_or_else(|| random_hex(20));
+            .unwrap_or_else(|| crate::fs::random_hex(10));
         file.push_str(&format!(
             "        $loader->setApcuPrefix({});\n",
             var_export_str(&prefix)

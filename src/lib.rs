@@ -17,6 +17,7 @@ pub mod package;
 pub mod schema;
 pub mod semver;
 pub mod spdx;
+pub mod store;
 pub mod transaction;
 pub mod validation;
 

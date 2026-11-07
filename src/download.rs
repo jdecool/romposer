@@ -30,6 +30,7 @@ pub struct Downloader {
     vendor_dir: String,
     cache_dir: Option<String>,
     cache_read_only: bool,
+    write_cache: bool,
     client: reqwest::Client,
     runtime: tokio::runtime::Runtime,
     last_cache_writes: HashMap<String, String>,
@@ -407,10 +408,16 @@ impl Downloader {
             vendor_dir: config.vendor_dir(),
             cache_dir,
             cache_read_only: config.bool("cache-read-only"),
+            write_cache: true,
             client,
             runtime,
             last_cache_writes: HashMap::new(),
         })
+    }
+
+    /// When false the zip cache is read but never written (the store holds the files instead).
+    pub fn set_write_cache(&mut self, write: bool) {
+        self.write_cache = write;
     }
 
     fn cache_path(&self, key: &str) -> Option<PathBuf> {
@@ -504,7 +511,10 @@ impl Downloader {
         if !jobs.is_empty() {
             let client = self.client.clone();
             let config = self.config.clone();
-            let cache_dir = self.cache_dir.clone().filter(|_| !self.cache_read_only);
+            let cache_dir = self
+                .cache_dir
+                .clone()
+                .filter(|_| !self.cache_read_only && self.write_cache);
             let outcomes = self.runtime.block_on(async move {
                 let mut handles = Vec::new();
                 for (package, file_name, urls, checksum) in jobs {
@@ -565,8 +575,11 @@ impl Downloader {
         }
         let mut temporary_dir;
         loop {
-            temporary_dir =
-                PathBuf::from(format!("{}/composer/{}", self.vendor_dir, random_hex(8)));
+            temporary_dir = PathBuf::from(format!(
+                "{}/composer/{}",
+                self.vendor_dir,
+                crate::fs::random_hex(4)
+            ));
             if !temporary_dir.is_dir() {
                 break;
             }
@@ -638,21 +651,6 @@ impl Downloader {
             }
         }
     }
-}
-
-fn random_hex(len: usize) -> String {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut x = seed ^ (u128::from(std::process::id()) << 64);
-    let mut out = String::new();
-    while out.len() < len {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.push_str(&format!("{:x}", x & 0xf));
-    }
-    out
 }
 
 fn rename(from: &Path, to: &Path) -> Result<(), String> {

@@ -9,7 +9,7 @@ pub mod lint;
 pub mod writer;
 
 pub use serde_json::{Map, Value};
-pub use writer::{encode_compact, encode_pretty};
+pub use writer::{encode, encode_compact, encode_pretty};
 
 #[cfg(test)]
 mod tests {

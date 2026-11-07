@@ -1,18 +1,22 @@
 //! Port of `Installer::run` / `doInstall` for an install from an existing lock,
 //! plus the `InstallationManager` execution loop (download everything, then
-//! install in order, binaries, installed.json).
+//! install in order, binaries, installed.json). Zip dists go through the
+//! pcomposer store by default; the plain Composer path is the fallback.
 
 use crate::binaries::BinaryInstaller;
 use crate::config::Config;
-use crate::download::Downloader;
-use crate::fs::{ensure_dir, realpath};
+use crate::download::{Downloader, extract_zip};
+use crate::fs::{ensure_dir, is_dir_empty, realpath, remove};
 use crate::installed::InstalledRepository;
 use crate::io::Io;
 use crate::lock::Lock;
 use crate::package::Package;
 use crate::package::root::RootPackage;
+use crate::store::{Manifest, Store, StoreConfig};
 use crate::transaction::{Operation, calculate_operations};
+use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 pub const ERROR_GENERIC_FAILURE: i32 = 1;
 pub const ERROR_DEPENDENCY_RESOLUTION_FAILED: i32 = 2;
@@ -21,6 +25,10 @@ pub const ERROR_LOCK_FILE_INVALID: i32 = 4;
 pub const ERROR_AUDIT_FAILED: i32 = 5;
 pub const ERROR_PSR_AUTOLOAD_VIOLATION: i32 = 6;
 pub const ERROR_TRANSPORT_EXCEPTION: i32 = 100;
+
+static METADATA_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\._.*|\.DS_Store|__MACOSX|\.AppleDouble|\.fseventsd|\.Spotlight-V100|\.Trashes|(?i:thumbs\.db|desktop\.ini))$").unwrap()
+});
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -81,6 +89,14 @@ fn unsupported(package: &Package) -> Option<String> {
             package.pretty_name
         )),
     }
+}
+
+/// The store side of a run: configuration, store, manifest and the one-per-run fallback warning.
+struct StoreRun {
+    config: StoreConfig,
+    store: Store,
+    manifest: Manifest,
+    fallback_warned: bool,
 }
 
 impl Installer<'_> {
@@ -176,6 +192,21 @@ impl Installer<'_> {
             bin_compat: self.config.get_str("bin-compat"),
             vendor_dir: self.config.vendor_dir(),
         }
+    }
+
+    fn store_run(&self, vendor_dir: &str) -> Result<Option<StoreRun>, String> {
+        let config =
+            StoreConfig::from_root(&self.root.package.extra, &self.config.get_str("cache-dir"))?;
+        if !config.enabled {
+            return Ok(None);
+        }
+        let store = Store::new(&config.root);
+        Ok(Some(StoreRun {
+            config,
+            store,
+            manifest: Manifest::in_vendor_dir(vendor_dir),
+            fallback_warned: false,
+        }))
     }
 
     /// `Installer::doInstall`
@@ -302,7 +333,7 @@ impl Installer<'_> {
         )
     }
 
-    /// `InstallationManager::execute`
+    /// `InstallationManager::execute`, with pcomposer's `StoreZipDownloader::install` for zip dists.
     fn execute(
         &mut self,
         local_repo: &mut InstalledRepository,
@@ -321,21 +352,34 @@ impl Installer<'_> {
 
         ensure_dir(Path::new(vendor_dir))?;
         let vendor_dir = realpath(Path::new(vendor_dir));
+        let mut store_run = self.store_run(&vendor_dir)?;
         let mut downloader = Downloader::new(self.config)?;
+        // no zip cache when the store is active: the store is the cache
+        downloader.set_write_cache(store_run.is_none());
         let mut binaries = self.binary_installer();
 
-        // execute all downloads first
-        let to_download: Vec<&Package> = operations
+        // execute all downloads first, skipping packages the store already holds
+        let to_install: Vec<&Package> = operations
             .iter()
             .filter_map(|op| match op {
                 Operation::Install(p) | Operation::Update { target: p, .. } => Some(p),
                 _ => None,
             })
             .collect();
+        let to_download: Vec<&Package> = to_install
+            .iter()
+            .copied()
+            .filter(|p| {
+                !goes_through_store(&store_run, &vendor_dir, p)
+                    || !store_run
+                        .as_ref()
+                        .is_some_and(|run| run.store.has(&Store::key(p)))
+            })
+            .collect();
         let mut archives = downloader.download_all(self.io, &to_download)?;
 
         if self.options.download_only {
-            for package in &to_download {
+            for package in &to_install {
                 downloader.cleanup(
                     package,
                     Path::new(&install_path(&vendor_dir, package).unwrap_or_default()),
@@ -348,19 +392,18 @@ impl Installer<'_> {
             match op {
                 Operation::Install(package) => {
                     let path = install_path(&vendor_dir, package).unwrap();
-                    self.io.error(&format!(
-                        "  - Installing {} ({}): Extracting archive",
-                        package.pretty_name,
-                        package.full_pretty_version()
-                    ));
                     if !Path::new(&path).exists() && local_repo.has_package(package) {
                         binaries.remove_binaries(package)?;
                     }
-                    let archive = archives
-                        .remove(&package.unique_name())
-                        .ok_or("missing download")?
-                        .archive;
-                    downloader.install_archive(package, &archive, Path::new(&path))?;
+                    self.install_code(
+                        &mut store_run,
+                        &mut downloader,
+                        &mut archives,
+                        package,
+                        Path::new(&path),
+                        &vendor_dir,
+                        None,
+                    )?;
                     binaries.install_binaries(self.io, package, Path::new(&path), true)?;
                     if !local_repo.has_package(package) {
                         let mut installed = package.clone();
@@ -372,24 +415,17 @@ impl Installer<'_> {
                 Operation::Update { initial, target } => {
                     let initial_path = install_path(&vendor_dir, initial).unwrap();
                     let target_path = install_path(&vendor_dir, target).unwrap();
-                    let action = if crate::semver::is_upgrade(&initial.version, &target.version) {
-                        "Upgrading"
-                    } else {
-                        "Downgrading"
-                    };
-                    self.io.error(&format!(
-                        "  - {action} {} ({} => {}): Extracting archive",
-                        initial.pretty_name,
-                        initial.full_pretty_version(),
-                        target.full_pretty_version()
-                    ));
                     binaries.remove_binaries(initial)?;
-                    crate::fs::remove(Path::new(&initial_path))?;
-                    let archive = archives
-                        .remove(&target.unique_name())
-                        .ok_or("missing download")?
-                        .archive;
-                    downloader.install_archive(target, &archive, Path::new(&target_path))?;
+                    remove(Path::new(&initial_path))?;
+                    self.install_code(
+                        &mut store_run,
+                        &mut downloader,
+                        &mut archives,
+                        target,
+                        Path::new(&target_path),
+                        &vendor_dir,
+                        Some(initial),
+                    )?;
                     binaries.install_binaries(self.io, target, Path::new(&target_path), true)?;
                     local_repo.remove_package(initial);
                     if !local_repo.has_package(target) {
@@ -406,12 +442,12 @@ impl Installer<'_> {
                         package.full_pretty_version()
                     ));
                     if let Some(path) = install_path(&vendor_dir, package) {
-                        crate::fs::remove(Path::new(&path))?;
+                        remove(Path::new(&path))?;
                         binaries.remove_binaries(package)?;
                         if let Some(parent) = Path::new(&path).parent()
                             && package.name.contains('/')
                             && parent.is_dir()
-                            && crate::fs::is_dir_empty(parent)
+                            && is_dir_empty(parent)
                         {
                             let _ = std::fs::remove_dir(parent);
                         }
@@ -429,6 +465,137 @@ impl Installer<'_> {
         }
         // do a last write so that we write the repository even if nothing changed
         self.write_local_repo(local_repo, &vendor_dir)?;
+        if let Some(run) = &store_run {
+            let installed: Vec<Package> = local_repo
+                .canonical_packages()
+                .into_iter()
+                .cloned()
+                .collect();
+            run.manifest.write(&installed)?;
+        }
         Ok(())
     }
+
+    /// `ArchiveDownloader::install` or `StoreZipDownloader::install` for one package.
+    #[allow(clippy::too_many_arguments)]
+    fn install_code(
+        &mut self,
+        store_run: &mut Option<StoreRun>,
+        downloader: &mut Downloader,
+        archives: &mut std::collections::HashMap<String, crate::download::Downloaded>,
+        package: &Package,
+        path: &Path,
+        vendor_dir: &str,
+        initial: Option<&Package>,
+    ) -> Result<(), String> {
+        let label = match initial {
+            Some(i) => {
+                let action = if crate::semver::is_upgrade(&i.version, &package.version) {
+                    "Upgrading"
+                } else {
+                    "Downgrading"
+                };
+                format!(
+                    "{action} {} ({} => {})",
+                    i.pretty_name,
+                    i.full_pretty_version(),
+                    package.full_pretty_version()
+                )
+            }
+            None => format!(
+                "Installing {} ({})",
+                package.pretty_name,
+                package.full_pretty_version()
+            ),
+        };
+        if !goes_through_store(store_run, vendor_dir, package) {
+            self.io.error(&format!("  - {label}: Extracting archive"));
+            let archive = archives
+                .remove(&package.unique_name())
+                .ok_or("missing download")?
+                .archive;
+            return downloader.install_archive(package, &archive, path);
+        }
+        let run = store_run.as_mut().unwrap();
+        let key = Store::key(package);
+        let cached = run.store.has(&key);
+        self.io.error(&format!(
+            "  - {label}: Linking from store{}",
+            if cached { " (cached)" } else { "" }
+        ));
+        crate::fs::empty_directory(path)?;
+        if !cached {
+            let archive = archives
+                .remove(&package.unique_name())
+                .ok_or("missing download")?
+                .archive;
+            let parent = path.parent().unwrap_or(Path::new(vendor_dir)).to_path_buf();
+            ensure_dir(&parent)?;
+            let mut temporary_dir;
+            loop {
+                temporary_dir = parent.join(format!(".pcomposer-{}", crate::fs::random_hex(4)));
+                if !temporary_dir.is_dir() {
+                    break;
+                }
+            }
+            ensure_dir(&temporary_dir)?;
+            let result = extract_zip(&archive, &temporary_dir).and_then(|()| {
+                let _ = remove(&archive);
+                run.store.ingest(&key, &package_root(&temporary_dir))
+            });
+            let _ = remove(&temporary_dir);
+            if let Err(e) = result {
+                let _ = remove(path);
+                return Err(e);
+            }
+        }
+        let wanted = run.config.strategy_for(&package.name, &package.kind);
+        let used = run
+            .store
+            .materialise(&key, path, wanted, &package.binaries)?;
+        if !run.fallback_warned
+            && let Some(reason) = run.store.fallback_reason()
+        {
+            run.fallback_warned = true;
+            self.io.error(&format!(
+                "pcomposer: {wanted} failed ({reason}), falling back to copy for this run"
+            ));
+        }
+        run.manifest.record(package, used.as_str());
+        Ok(())
+    }
+}
+
+/// pcomposer's boundary: zip dist, store enabled, target empty or missing.
+fn goes_through_store(store_run: &Option<StoreRun>, vendor_dir: &str, package: &Package) -> bool {
+    if store_run.is_none() {
+        return false;
+    }
+    if package.dist.as_ref().map(|d| d.kind.as_str()) != Some("zip") {
+        return false;
+    }
+    match install_path(vendor_dir, package) {
+        Some(path) => !(Path::new(&path).is_dir() && !is_dir_empty(Path::new(&path))),
+        None => false,
+    }
+}
+
+/// Unwraps a single top-level directory (GitHub zipballs), ignoring OS metadata siblings.
+fn package_root(extracted: &Path) -> PathBuf {
+    let entries: Vec<PathBuf> = std::fs::read_dir(extracted)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    !p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| METADATA_NAME.is_match(n))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.len() == 1 && entries[0].is_dir() {
+        return entries[0].clone();
+    }
+    extracted.to_path_buf()
 }

@@ -239,6 +239,16 @@ pub fn realpath(path: &Path) -> String {
     }
 }
 
+/// `bin2hex(random_bytes($bytes))`: hex of OS randomness.
+pub fn random_hex(bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .expect("/dev/urandom is readable on macOS and Linux");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// `Platform::getCwd`
 pub fn cwd() -> String {
     std::env::current_dir()
