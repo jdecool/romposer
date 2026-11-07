@@ -206,7 +206,7 @@ impl Installer<'_> {
         }
         // ponytail: no platform/solver verification of the lock yet (tickets 07 and 10)
 
-        let operations = calculate_operations(&local_repo.packages, &locked);
+        let operations = calculate_operations(&local_repo.packages, &locked)?;
         let mut installs = Vec::new();
         let mut updates = Vec::new();
         let mut uninstalls = Vec::new();

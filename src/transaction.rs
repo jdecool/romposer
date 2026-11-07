@@ -109,8 +109,69 @@ fn package_sort(a: &Package, b: &Package) -> std::cmp::Ordering {
     b.name.cmp(&a.name)
 }
 
+/// `ValidatingArrayLoader::validatePackage`: the security subset re-applied to
+/// packages loaded without validation (installed.json, the lock).
+pub fn validate_package(package: &Package) -> Result<(), String> {
+    if let Some(err) = crate::package::naming_error(&package.name, false) {
+        return Err(format!(
+            "Invalid package found during dependency resolution, aborting: {err}"
+        ));
+    }
+    let leading_dash = regex::Regex::new(r"^\s*-").unwrap();
+    let fields = [
+        ("source.url", package.source.as_ref().map(|s| s.url.clone())),
+        (
+            "source.reference",
+            package.source.as_ref().and_then(|s| s.reference.clone()),
+        ),
+        ("dist.url", package.dist.as_ref().map(|d| d.url.clone())),
+        (
+            "dist.reference",
+            package.dist.as_ref().and_then(|d| d.reference.clone()),
+        ),
+    ];
+    for (field, value) in fields {
+        if let Some(v) = value
+            && leading_dash.is_match(&v)
+        {
+            return Err(format!(
+                "{} has an invalid {field}, it must not start with a \"-\": {v}",
+                package.name
+            ));
+        }
+    }
+    let dotdot = regex::Regex::new(r"(?:^|[\\/])\.\.(?:[\\/]|$)").unwrap();
+    for bin in &package.binaries {
+        if dotdot.is_match(bin) {
+            return Err(format!(
+                "{} has an invalid bin {bin}, it must not contain \"..\" path segments",
+                package.name
+            ));
+        }
+    }
+    if let Some(target) = &package.target_dir
+        && (dotdot.is_match(target) || target.starts_with('/'))
+    {
+        return Err(format!(
+            "{} has an invalid target-dir {target}, it must stay inside the package directory",
+            package.name
+        ));
+    }
+    Ok(())
+}
+
 /// `Transaction::__construct` + `getOperations`
-pub fn calculate_operations(present: &[Package], result: &[Package]) -> Vec<Operation> {
+pub fn calculate_operations(
+    present: &[Package],
+    result: &[Package],
+) -> Result<Vec<Operation>, String> {
+    for package in present.iter().chain(result.iter()) {
+        validate_package(package)?;
+    }
+    Ok(calculate_operations_unchecked(present, result))
+}
+
+fn calculate_operations_unchecked(present: &[Package], result: &[Package]) -> Vec<Operation> {
     // resultPackageMap: identity by index, sorted by name descending (aliases first)
     let mut order: Vec<usize> = (0..result.len()).collect();
     order.sort_by(|a, b| package_sort(&result[*a], &result[*b]));
@@ -313,7 +374,7 @@ mod tests {
             pkg(r#"{"name":"a/base","version":"1.0"}"#),
             pkg(r#"{"name":"d/other","version":"1.0"}"#),
         ];
-        let ops = calculate_operations(&[], &result);
+        let ops = calculate_operations(&[], &result).unwrap();
         let names: Vec<&str> = ops.iter().map(|o| o.package().name.as_str()).collect();
         assert_eq!(names, vec!["a/base", "b/lib", "c/app", "d/other"]);
     }
@@ -330,7 +391,7 @@ mod tests {
                 r#"{"name":"p/plugin","version":"1.0","type":"composer-plugin","require":{"composer-plugin-api":"^2"}}"#,
             ),
         ];
-        let ops = calculate_operations(&present, &result);
+        let ops = calculate_operations(&present, &result).unwrap();
         let shown: Vec<String> = ops.iter().map(Operation::show).collect();
         assert_eq!(
             shown,
@@ -339,6 +400,22 @@ mod tests {
                 "Installing p/plugin (1.0)",
                 "Upgrading a/base (0.9 => 1.0)"
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_packages_that_could_escape_the_vendor_dir() {
+        let bad = pkg(r#"{"name":"a/b","version":"1.0","target-dir":"../../etc"}"#);
+        assert!(
+            calculate_operations(&[], &[bad])
+                .unwrap_err()
+                .contains("invalid target-dir")
+        );
+        let bad = pkg(r#"{"name":"a/b","version":"1.0","dist":{"type":"zip","url":"-evil"}}"#);
+        assert!(
+            calculate_operations(&[], &[bad])
+                .unwrap_err()
+                .contains("must not start with")
         );
     }
 
@@ -353,7 +430,7 @@ mod tests {
             packages.push(p);
             packages.push(real);
         }
-        let ops = calculate_operations(&[], &packages);
+        let ops = calculate_operations(&[], &packages).unwrap();
         assert_eq!(
             ops.iter().map(Operation::kind).collect::<Vec<_>>(),
             vec!["install", "markAliasInstalled"]

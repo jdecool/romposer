@@ -144,6 +144,42 @@ pub fn auth_headers(
     )]
 }
 
+/// `Url::sanitize`: credentials and access tokens never reach messages.
+pub fn sanitize_url(url: &str) -> String {
+    let url = Regex::new(r"([&?]access_token=)[^&]+")
+        .unwrap()
+        .replace_all(url, "$1***")
+        .into_owned();
+    let re = Regex::new(r"(?i)(?:(?P<prefix>[a-z0-9][a-z0-9+.-]*://)|^)(?P<user>[^:/\s?#]*)(?::(?P<password>[^\s/?#]*))?@").unwrap();
+    re.replace_all(&url, |caps: &regex::Captures<'_>| {
+        let prefix = caps.name("prefix").map_or("", |m| m.as_str());
+        let user = caps.name("user").map_or("", |m| m.as_str());
+        let user = if matches!(
+            user,
+            "x-token-auth" | "gitlab-ci-token" | "oauth2" | "private-token" | "x-oauth-basic"
+        ) {
+            user.to_string()
+        } else if user.len() >= 12
+            || Regex::new(r"^gh[a-z]_[a-zA-Z0-9_]+$")
+                .unwrap()
+                .is_match(user)
+        {
+            format!("{}***", &user[..user.len().min(3)])
+        } else {
+            user.to_string()
+        };
+        if caps
+            .name("password")
+            .is_some_and(|p| !p.as_str().is_empty())
+        {
+            format!("{prefix}{user}:***@")
+        } else {
+            format!("{prefix}{user}@")
+        }
+    })
+    .into_owned()
+}
+
 fn base64_encode(input: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
@@ -354,6 +390,7 @@ impl Downloader {
             None
         };
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!(
                 "Composer/{} (romposer; {})",
                 crate::COMPOSER_VERSION,
@@ -655,11 +692,14 @@ fn rename_recursively(package: &Package, from: &Path, to: &Path) -> Result<(), S
 }
 
 /// What `unzip -qq` leaves on disk: entries with their stored unix modes, symlinks restored.
+/// Regular entries are written first and symlinks last, so no entry is ever written
+/// through a link, and a link may only point inside the extraction root.
 pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| format!("Failed to extract {}: {e}", archive.display()))?;
     let umask = crate::binaries::umask();
+    let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let Some(rel) = entry.enclosed_name() else {
@@ -681,8 +721,7 @@ pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
         if mode.is_some_and(|m| m & 0o170000 == 0o120000) {
             let mut link = String::new();
             std::io::Read::read_to_string(&mut entry, &mut link).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&out);
-            std::os::unix::fs::symlink(&link, &out).map_err(|e| e.to_string())?;
+            symlinks.push((out, link));
             continue;
         }
         let mut dest = std::fs::File::create(&out)
@@ -693,6 +732,24 @@ pub fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
             _ => 0o666 & !umask,
         };
         let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(perm));
+    }
+    for (out, link) in symlinks {
+        let resolved = normalize_path(&format!(
+            "{}/{link}",
+            out.parent().unwrap_or(target).to_string_lossy()
+        ));
+        let root = normalize_path(&target.to_string_lossy());
+        if Path::new(&link).is_absolute()
+            || !(resolved == root || resolved.starts_with(&format!("{root}/")))
+        {
+            return Err(format!(
+                "Failed to extract {}: symlink {} points outside of the package ({link})",
+                archive.display(),
+                out.display()
+            ));
+        }
+        let _ = std::fs::remove_file(&out);
+        std::os::unix::fs::symlink(&link, &out).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -770,52 +827,81 @@ async fn fetch_with_retries(
     Err(last_err)
 }
 
+/// One request with Composer's redirect handling: at most 20 hops, auth
+/// recomputed for each hop's origin, plain http refused under secure-http.
 async fn fetch_once(
     client: &reqwest::Client,
     config: &Config,
     url: &str,
     file_name: &Path,
 ) -> Result<(), (Option<u16>, String)> {
-    if url.starts_with("http://") && config.bool("secure-http") {
-        return Err((
-            None,
-            format!(
-                "Your configuration does not allow connections to {url}. See https://getcomposer.org/doc/06-config.md#secure-http for details."
-            ),
-        ));
-    }
-    let mut request = client.get(url);
-    let origin = origin(config, url);
-    if let Some(auth) = config.authentication(&origin) {
-        for (k, v) in auth_headers(config, &origin, url, &auth) {
-            request = request.header(k, v);
+    let mut url = url.to_string();
+    for _ in 0..=20 {
+        if url.starts_with("http://") && config.bool("secure-http") {
+            return Err((
+                None,
+                format!(
+                    "Your configuration does not allow connections to {}. See https://getcomposer.org/doc/06-config.md#secure-http for details.",
+                    sanitize_url(&url)
+                ),
+            ));
         }
+        let mut request = client.get(&url);
+        let origin = origin(config, &url);
+        if let Some(auth) = config.authentication(&origin) {
+            for (k, v) in auth_headers(config, &origin, &url, &auth) {
+                request = request.header(k, v);
+            }
+        }
+        let response = request.send().await.map_err(|e| {
+            (
+                None,
+                format!("curl error while downloading {}: {e}", sanitize_url(&url)),
+            )
+        })?;
+        let status = response.status();
+        if status.is_redirection()
+            && let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+        {
+            let base = reqwest::Url::parse(&url).map_err(|e| (None, e.to_string()))?;
+            let next = base.join(location).map_err(|e| (None, e.to_string()))?;
+            url = next.to_string();
+            continue;
+        }
+        if !status.is_success() {
+            let version = match response.version() {
+                reqwest::Version::HTTP_2 => "HTTP/2".to_string(),
+                reqwest::Version::HTTP_11 => "HTTP/1.1".to_string(),
+                v => format!("{v:?}"),
+            };
+            return Err((
+                Some(status.as_u16()),
+                format!(
+                    "The \"{}\" file could not be downloaded ({version} {} returned)",
+                    sanitize_url(&url),
+                    status.as_u16()
+                ),
+            ));
+        }
+        let bytes = response.bytes().await.map_err(|e| {
+            (
+                None,
+                format!("curl error while downloading {}: {e}", sanitize_url(&url)),
+            )
+        })?;
+        std::fs::write(file_name, &bytes).map_err(|e| (None, format!("{} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", sanitize_url(&url), file_name.display())))?;
+        return Ok(());
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| (None, format!("curl error while downloading {url}: {e}")))?;
-    let status = response.status();
-    if !status.is_success() {
-        let version = match response.version() {
-            reqwest::Version::HTTP_2 => "HTTP/2".to_string(),
-            reqwest::Version::HTTP_11 => "HTTP/1.1".to_string(),
-            v => format!("{v:?}"),
-        };
-        return Err((
-            Some(status.as_u16()),
-            format!(
-                "The \"{url}\" file could not be downloaded ({version} {} returned)",
-                status.as_u16()
-            ),
-        ));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| (None, format!("curl error while downloading {url}: {e}")))?;
-    std::fs::write(file_name, &bytes).map_err(|e| (None, format!("{url} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", file_name.display())))?;
-    Ok(())
+    Err((
+        None,
+        format!(
+            "The \"{}\" file could not be downloaded: too many redirects",
+            sanitize_url(&url)
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -862,6 +948,26 @@ mod tests {
         );
         assert_eq!(dist_path(&p, true), "");
         assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn urls_are_sanitised_in_messages() {
+        assert_eq!(
+            sanitize_url("https://user:secret@example.com/a.zip"),
+            "https://user:***@example.com/a.zip"
+        );
+        assert_eq!(
+            sanitize_url("https://ghp_abcdefghijklmnop:x-oauth-basic@github.com/x"),
+            "https://ghp***:***@github.com/x"
+        );
+        assert_eq!(
+            sanitize_url("https://api.github.com/x?access_token=abc&b=1"),
+            "https://api.github.com/x?access_token=***&b=1"
+        );
+        assert_eq!(
+            sanitize_url("https://example.com/plain.zip"),
+            "https://example.com/plain.zip"
+        );
     }
 
     #[test]
