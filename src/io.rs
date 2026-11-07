@@ -54,6 +54,13 @@ impl Io {
         }
     }
 
+    /// Repository-supplied text with control characters (terminal escapes) removed.
+    pub fn clean(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .collect()
+    }
+
     /// Symfony `Terminal::getWidth`: `COLUMNS`, else the controlling terminal, else 80.
     pub fn terminal_width() -> usize {
         if let Ok(cols) = std::env::var("COLUMNS")

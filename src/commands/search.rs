@@ -131,6 +131,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             }
             description = format!("{}...", &description[..end]);
         }
+        let (name, description) = (Io::clean(&name), Io::clean(&description));
         io.write(&format!("{name:<name_length$}{warning}{description}"));
     }
     Ok(0)

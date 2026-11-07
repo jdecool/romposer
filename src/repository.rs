@@ -295,6 +295,10 @@ impl ComposerRepository {
             .unwrap()
             .replace_all(key, "-")
             .into_owned();
+        // an `includes` key from packages.json must stay inside the cache directory
+        if safe.is_empty() || safe == "." || safe == ".." {
+            return None;
+        }
         self.cache_root.as_ref().map(|r| r.join(safe))
     }
 
@@ -325,9 +329,10 @@ impl ComposerRepository {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let Some(name) = path.file_name() else { return };
         let tmp = path.with_file_name(format!(
             "{}{}.tmp",
-            path.file_name().unwrap().to_string_lossy(),
+            name.to_string_lossy(),
             crate::fs::random_hex(5)
         ));
         if std::fs::write(&tmp, contents).is_ok() {

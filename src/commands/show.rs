@@ -853,12 +853,11 @@ fn print_package_text(
         })
         .collect();
     io.write(&format!("versions : {}", shown.join(", ")));
-    if is_installed && let Some(date) = &package.release_date {
-        io.write(&format!(
-            "released : {}, {}",
-            &crate::package::dumper::rfc3339(date)[..10],
-            relative_time(date)
-        ));
+    if is_installed
+        && let Some(date) = &package.release_date
+        && let Some(day) = crate::package::dumper::rfc3339(date).get(..10)
+    {
+        io.write(&format!("released : {day}, {}", relative_time(date)));
     }
     io.write(&format!("type     : {}", package.kind));
     for id in &package.license {
@@ -1097,6 +1096,6 @@ fn print_packages(
             line.push(' ');
             line.push_str(path.as_str().unwrap_or("null"));
         }
-        io.write(&line);
+        io.write(&Io::clean(&line));
     }
 }
