@@ -190,7 +190,12 @@ fn archivable(sources: &Path, excludes: &[String], ignore_filters: bool) -> Vec<
             // symlinks leaving the project are skipped
             let real = std::fs::canonicalize(&path).ok()?;
             let real = crate::fs::normalize_path(&real.to_string_lossy());
-            let rel = real.strip_prefix(&root)?.to_string();
+            let rel = real.strip_prefix(&root)?;
+            // `/a/bc` is not under `/a/b`: only an exact match or a `/` boundary counts
+            if !rel.is_empty() && !rel.starts_with('/') {
+                return None;
+            }
+            let rel = rel.to_string();
             if !kept(&rel) {
                 return None;
             }

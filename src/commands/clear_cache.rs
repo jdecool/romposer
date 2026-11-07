@@ -79,6 +79,12 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             continue;
         };
         let shown = real.display().to_string();
+        // a project composer.json can point cache-dir anywhere: never wipe `/` or the home dir
+        let home = std::env::var("HOME").ok().and_then(|h| std::fs::canonicalize(h).ok());
+        if real.parent().is_none() || Some(&real) == home.as_ref() {
+            io.error(&format!("Cache is not enabled ({key}): {shown}"));
+            continue;
+        }
         let writable = std::fs::metadata(&real).is_ok_and(|m| !m.permissions().readonly());
         if !writable {
             io.error(&format!("Cache is not enabled ({key}): {shown}"));

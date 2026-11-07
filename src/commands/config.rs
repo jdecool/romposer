@@ -134,6 +134,9 @@ impl ConfigSource {
             restore_empty_objects(&mut data);
             crate::json::encode_pretty(&Value::Object(data)) + "\n"
         };
+        if !exists {
+            create_private(&self.path);
+        }
         std::fs::write(&self.path, &written)
             .map_err(|_| format!("The file \"{}\" is not writable.", self.path.display()))?;
         let parsed: Value = serde_json::from_str(&written).unwrap_or(Value::Null);
@@ -143,9 +146,6 @@ impl ConfigSource {
                 "Failed to update composer.json with a valid format, reverting to the original content. Please report an issue to us with details (command you run and a copy of your composer.json). \n{}",
                 errors.join("\n")
             ));
-        }
-        if !exists {
-            chmod_600(&self.path);
         }
         Ok(())
     }
@@ -255,9 +255,14 @@ impl ConfigSource {
     }
 }
 
-fn chmod_600(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+/// Creates `path` empty with mode 600 so secrets never sit in a world-readable file.
+fn create_private(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
 }
 
 /// `splitPropertyKey`: extra/scripts nest two levels deep, suggest/autoload one.
@@ -884,8 +889,8 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     }
     if args.global && !config_file.exists() {
         let _ = std::fs::create_dir_all(&home);
+        create_private(&config_file);
         std::fs::write(&config_file, "{\n    \"config\": {}\n}\n").map_err(|e| e.to_string())?;
-        chmod_600(&config_file);
     }
     if !config_file.exists() {
         return Err(format!(
@@ -915,8 +920,8 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         .map(|k| format!("    \"{k}\": {{}}"))
         .collect::<Vec<_>>()
         .join(",\n");
+        create_private(&auth_file);
         std::fs::write(&auth_file, format!("{{\n{empty}\n}}\n")).map_err(|e| e.to_string())?;
-        chmod_600(&auth_file);
     }
     let source = ConfigSource::new(&config_file, false);
     let auth_source = ConfigSource::new(&auth_file, true);
