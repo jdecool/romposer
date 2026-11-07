@@ -7,6 +7,7 @@ use crate::config::{Auth, Config};
 use crate::fs::{empty_directory, ensure_dir, is_dir_empty, normalize_path, realpath, remove};
 use crate::io::Io;
 use crate::package::Package;
+use crate::store::Store;
 use regex::Regex;
 use sha1::Digest;
 
@@ -813,6 +814,98 @@ pub fn extract_zip_hashed(
     Ok(hashes)
 }
 
+/// Cold store ingest straight from the zip: every regular entry is streamed into the store,
+/// no extraction tree, recording what `extract_zip` + `Store::ingest` of the package root
+/// would. `Ok(false)`, nothing written, when only the extracted tree can tell: symlinks
+/// (resolved on disk), non-ASCII names (unicode folding) or names colliding once case-folded.
+pub fn ingest_zip(archive: &Path, store: &Store, key: &str) -> Result<bool, String> {
+    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Failed to extract {}: {e}", archive.display()))?;
+    // (index, path, is_file, executable); folded path -> (path, is_file); dirs with children
+    let mut entries = Vec::new();
+    let mut seen: HashMap<String, (String, bool)> = HashMap::new();
+    let mut parents = std::collections::HashSet::new();
+    let mut clash = |path: &str, file: bool| match seen.entry(path.to_ascii_lowercase()) {
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert((path.to_string(), file));
+            false
+        }
+        std::collections::hash_map::Entry::Occupied(o) => o.get().0 != path || file || o.get().1,
+    };
+    for i in 0..zip.len() {
+        let entry = zip.by_index_raw(i).map_err(|e| e.to_string())?;
+        let Some(rel) = entry.enclosed_name() else {
+            return Err(format!(
+                "Failed to extract {}: invalid entry name {:?}",
+                archive.display(),
+                entry.name()
+            ));
+        };
+        let mode = entry.unix_mode();
+        if mode.is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Ok(false);
+        }
+        let path = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => n.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if !path.is_ascii() {
+            return Ok(false);
+        }
+        if path.is_empty() {
+            continue;
+        }
+        for (end, _) in path.match_indices('/') {
+            parents.insert(path[..end].to_string());
+            if clash(&path[..end], false) {
+                return Ok(false);
+            }
+        }
+        let is_file = !entry.is_dir();
+        if clash(&path, is_file) {
+            return Ok(false);
+        }
+        entries.push((i, path, is_file, mode.is_some_and(|m| m & 0o111 != 0)));
+    }
+    // `package_root`: a lone top-level directory, macOS/Windows metadata aside, is the package
+    let top: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .map(|e| e.1.split('/').next().unwrap())
+        .filter(|n| !METADATA_NAME.is_match(n))
+        .collect();
+    let root = match top.first() {
+        Some(t) if top.len() == 1 && !seen[&t.to_ascii_lowercase()].1 => format!("{t}/"),
+        _ => String::new(),
+    };
+    let mut index = crate::store::IndexEntry::default();
+    for (i, path, is_file, executable) in &entries {
+        let Some(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        if !is_file {
+            if !parents.contains(path) {
+                index.dirs.push(rel.to_string());
+            }
+            continue;
+        }
+        let mut entry = zip.by_index(*i).map_err(|e| e.to_string())?;
+        let hash = store.put_reader(&mut entry, *executable)?;
+        let mode = if *executable { 0o755 } else { 0o644 };
+        index
+            .files
+            .insert(rel.to_string(), crate::store::IndexFile { hash, mode });
+    }
+    index.dirs.sort();
+    index.dirs.dedup();
+    store.write_entry(key, &index)?;
+    Ok(true)
+}
+
 /// Writes through to the file, feeding the hasher with what was written.
 struct Hashing<'a>(&'a mut std::fs::File, Option<&'a mut sha2::Sha256>);
 
@@ -1240,10 +1333,85 @@ mod tests {
         let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
         for (name, body, mode) in files {
             let options = zip::write::SimpleFileOptions::default().unix_permissions(*mode);
+            if name.ends_with('/') {
+                zip.add_directory(*name, options).unwrap();
+                continue;
+            }
+            if mode & 0o170000 == 0o120000 {
+                zip.add_symlink(*name, *body, options).unwrap();
+                continue;
+            }
             zip.start_file(*name, options).unwrap();
             std::io::Write::write_all(&mut zip, body.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn ingest_zip_records_what_extract_then_ingest_would() {
+        let base = std::env::temp_dir().join(format!("romposer-ingest-zip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cases: [&[(&str, &str, u32)]; 2] = [
+            &[
+                ("pkg/", "", 0o755),
+                ("pkg/src/A.php", "<?php", 0o644),
+                ("pkg/src/B.php", "<?php", 0o644),
+                ("pkg/bin/run", "#!/bin/sh", 0o755),
+                ("pkg/src/empty/", "", 0o755),
+                ("pkg/src/full/", "", 0o755),
+                ("pkg/src/full/x", "x", 0),
+                ("pkg/.DS_Store", "meta", 0o644),
+                (".DS_Store", "dropped", 0o644),
+                ("__MACOSX/._a", "dropped", 0o644),
+            ],
+            &[
+                ("a.php", "a", 0o644),
+                ("._a.php", "kept", 0o644),
+                ("e/", "", 0o755),
+            ],
+        ];
+        for (n, files) in cases.iter().enumerate() {
+            let dir = base.join(n.to_string());
+            std::fs::create_dir_all(dir.join("out")).unwrap();
+            let archive = dir.join("a.zip");
+            zip_of(&archive, files);
+            let direct = Store::new(dir.join("direct"));
+            assert!(ingest_zip(&archive, &direct, "acme/lib@1.0.0.0-abc").unwrap());
+            extract_zip(&archive, &dir.join("out")).unwrap();
+            let root = if n == 0 {
+                dir.join("out/pkg")
+            } else {
+                dir.join("out")
+            };
+            let walked = Store::new(dir.join("walked"));
+            walked.ingest("acme/lib@1.0.0.0-abc", &root).unwrap();
+            let index = |s: &str| {
+                std::fs::read_to_string(dir.join(s).join("index/acme/lib@1.0.0.0-abc.json"))
+                    .unwrap()
+            };
+            assert_eq!(index("direct"), index("walked"));
+            assert_eq!(direct.size(), walked.size());
+        }
+        let entry = Store::new(base.join("0/direct"))
+            .entry("acme/lib@1.0.0.0-abc")
+            .unwrap();
+        assert_eq!(entry.dirs, vec!["src/empty"]);
+        assert_eq!(entry.files["bin/run"].mode, 0o755);
+        assert!(entry.files.contains_key(".DS_Store"));
+        // only the extracted tree can tell: nothing is written
+        for files in [
+            &[("pkg/a", "a", 0o644), ("pkg/l", "a", 0o120777)][..],
+            &[("pkg/README", "a", 0o644), ("pkg/readme", "b", 0o644)],
+            &[("pkg/A/x", "a", 0o644), ("pkg/a/y", "b", 0o644)],
+            &[("pkg/a", "a", 0o644), ("pkg/a/", "", 0o755)],
+            &[("pkg/caf\u{e9}", "a", 0o644)],
+        ] {
+            let archive = base.join("fallback.zip");
+            zip_of(&archive, files);
+            let store = Store::new(base.join("fallback"));
+            assert!(!ingest_zip(&archive, &store, "acme/lib@1.0.0.0-abc").unwrap());
+            assert!(!base.join("fallback").exists());
+        }
     }
 
     #[test]

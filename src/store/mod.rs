@@ -207,10 +207,15 @@ impl Store {
     ) -> Result<(), String> {
         let mut entry = IndexEntry::default();
         self.walk(dir, dir, hashes, &mut entry)?;
+        self.write_entry(key, &entry)
+    }
+
+    /// Writes the index entry for `key` (temp + rename).
+    pub fn write_entry(&self, key: &str, entry: &IndexEntry) -> Result<(), String> {
         let index = self.index_path(key)?;
         ensure_dir(index.parent().unwrap())?;
         let tmp = PathBuf::from(format!("{}.{}", index.display(), random_hex(4)));
-        std::fs::write(&tmp, Self::encode_entry(&entry))
+        std::fs::write(&tmp, Self::encode_entry(entry))
             .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &index)
             .map_err(|e| format!("Cannot write {}: {e}", index.display()))?;
@@ -378,6 +383,62 @@ impl Store {
         })();
         let _ = std::fs::remove_file(&tmp);
         result.map_err(|e| format!("Cannot write {} to the store: {e}", store_file.display()))
+    }
+
+    /// Streams `reader` into the store as a regular file and returns its sha256, hashed while
+    /// written. The name is only known once fully written, so the temp lives in `files/` (same
+    /// filesystem) and is linked to its hash name like `put`: an existing store file is never
+    /// rewritten.
+    pub fn put_reader(
+        &self,
+        reader: &mut dyn std::io::Read,
+        executable: bool,
+    ) -> Result<String, String> {
+        use std::io::Write;
+        static PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| random_hex(8));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let files = self.root.join("files");
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // ponytail: a crash leaves this temp in `files/`, which prune never scans
+        let tmp = files.join(format!(".tmp-{}-{n}", *PREFIX));
+        let mut write_error = true;
+        let result = (|| -> std::io::Result<String> {
+            let mut file = or_mkdir(&files, || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+            })?;
+            let mut hasher = sha2::Sha256::new();
+            let mut buf = vec![0u8; 65536];
+            loop {
+                write_error = false;
+                let n = reader.read(&mut buf)?;
+                write_error = true;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                file.write_all(&buf[..n])?;
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(if executable {
+                0o555
+            } else {
+                0o444
+            }))?;
+            drop(file);
+            let hash = hex(&hasher.finalize());
+            let dest = self.file_path(&hash, executable);
+            match or_mkdir(dest.parent().unwrap(), || std::fs::hard_link(&tmp, &dest)) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+                _ => Ok(hash),
+            }
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result.map_err(|e| match write_error {
+            true => format!("Cannot write {} to the store: {e}", tmp.display()),
+            false => e.to_string(),
+        })
     }
 
     /// Materialises the `key` entry into `target` with the strategy, refreshing the entry's mtime
@@ -642,6 +703,17 @@ pub fn privatise_tree(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `op`, retried once after creating `dir` when it failed for a missing directory.
+fn or_mkdir<T>(dir: &Path, op: impl Fn() -> std::io::Result<T>) -> std::io::Result<T> {
+    match op() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            op()
+        }
+        other => other,
+    }
+}
+
 /// The age window of `prune --older-than`: `<N>d`, `<N>h` or `<N>m` in seconds.
 pub fn parse_window(window: &str) -> Option<u64> {
     let (digits, unit) = window.split_at(window.len().checked_sub(1)?);
@@ -703,6 +775,36 @@ mod tests {
             sha256_file(&pkg.join("src/B.php")).unwrap()
         );
         assert!(base.join("store/files/ab").join(&given).is_file());
+    }
+
+    #[test]
+    fn put_reader_streams_into_the_layout_and_never_rewrites() {
+        let base = temp("put-reader");
+        let store = Store::new(base.join("store"));
+        let hash = store.put_reader(&mut "a".as_bytes(), false).unwrap();
+        assert_eq!(
+            hash,
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+        let stored = base.join("store/files/ca").join(&hash);
+        let meta = std::fs::metadata(&stored).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        assert_eq!(store.put_reader(&mut "a".as_bytes(), true).unwrap(), hash);
+        let exec = base.join("store/files/ca").join(format!("{hash}-x"));
+        assert_eq!(
+            std::fs::metadata(&exec).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        // same content again: the existing inode is kept, the temp is gone
+        store.put_reader(&mut "a".as_bytes(), false).unwrap();
+        assert_eq!(std::fs::metadata(&stored).unwrap().ino(), meta.ino());
+        assert_eq!(std::fs::metadata(&stored).unwrap().nlink(), 1);
+        let left: Vec<_> = std::fs::read_dir(base.join("store/files"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec!["ca"]);
     }
 
     #[test]

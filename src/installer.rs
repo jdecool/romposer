@@ -6,7 +6,7 @@
 
 use crate::binaries::BinaryInstaller;
 use crate::config::Config;
-use crate::download::{Downloader, extract_zip_hashed};
+use crate::download::{Downloader, extract_zip_hashed, ingest_zip};
 use crate::fs::{ensure_dir, is_dir_empty, realpath, remove};
 use crate::installed::InstalledRepository;
 use crate::io::Io;
@@ -1718,22 +1718,12 @@ impl FilesystemRun<'_> {
                 .remove(&package.unique_name())
                 .ok_or("missing download")?
                 .archive;
-            let parent = path.parent().unwrap_or(Path::new(vendor_dir)).to_path_buf();
-            ensure_dir(&parent)?;
-            let mut temporary_dir;
-            loop {
-                temporary_dir = parent.join(format!(".pcomposer-{}", crate::fs::random_hex(4)));
-                if !temporary_dir.is_dir() {
-                    break;
-                }
-            }
-            ensure_dir(&temporary_dir)?;
-            let result = extract_zip_hashed(&archive, &temporary_dir).and_then(|hashes| {
-                let _ = remove(&archive);
-                run.store
-                    .ingest_with_hashes(&key, &package_root(&temporary_dir), &hashes)
-            });
-            let _ = remove(&temporary_dir);
+            let parent = path.parent().unwrap_or(Path::new(vendor_dir));
+            let result = match ingest_zip(&archive, &run.store, &key) {
+                Ok(true) => remove(&archive),
+                Ok(false) => extract_and_ingest(&run.store, &archive, &key, parent),
+                Err(e) => Err(e),
+            };
             if let Err(e) = result {
                 let _ = remove(path);
                 return Err(e);
@@ -1754,6 +1744,31 @@ impl FilesystemRun<'_> {
         run.manifest.record(package, used.as_str());
         Ok(())
     }
+}
+
+/// The store ingest through a temporary extraction next to the package, for the zips
+/// `ingest_zip` cannot record without the extracted tree.
+fn extract_and_ingest(
+    store: &Store,
+    archive: &Path,
+    key: &str,
+    parent: &Path,
+) -> Result<(), String> {
+    ensure_dir(parent)?;
+    let mut temporary_dir;
+    loop {
+        temporary_dir = parent.join(format!(".pcomposer-{}", crate::fs::random_hex(4)));
+        if !temporary_dir.is_dir() {
+            break;
+        }
+    }
+    ensure_dir(&temporary_dir)?;
+    let result = extract_zip_hashed(archive, &temporary_dir).and_then(|hashes| {
+        let _ = remove(archive);
+        store.ingest_with_hashes(key, &package_root(&temporary_dir), &hashes)
+    });
+    let _ = remove(&temporary_dir);
+    result
 }
 
 /// `InstallOperation::format` / `UpdateOperation::format`
