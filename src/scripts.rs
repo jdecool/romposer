@@ -324,7 +324,7 @@ impl Dispatcher<'_> {
                         path_and_args = format!("{}{}", found.display(), &path_and_args[m.end()..]);
                     }
                     exec = format!("{} {path_and_args}", php_exec_command()?);
-                } else if let Some(php) = find_in_path("php") {
+                } else if let Some(php) = php_binary() {
                     put_env("PHP_BINARY", Some(&php.to_string_lossy()))?;
                 }
                 // `composer ...` runs this very binary, not one from bin-dir
@@ -464,9 +464,19 @@ fn composer_binary() -> String {
 
 /// `getPhpExecCommand` without the ini flags Composer copies from its own process.
 fn php_exec_command() -> Result<String, String> {
-    find_in_path("php")
+    php_binary()
         .map(|p| escape(&p.to_string_lossy()))
         .ok_or_else(|| "Failed to locate PHP binary to execute ".to_string())
+}
+
+/// The interpreter from the PATH romposer started with: never one from bin-dir, which a
+/// package could ship to hijack `@php` (Composer uses its running `PHP_BINARY`).
+fn php_binary() -> Option<PathBuf> {
+    std::env::var("PATH")
+        .ok()?
+        .split(':')
+        .map(|dir| Path::new(dir).join("php"))
+        .find(|p| p.is_file())
 }
 
 /// `ExecutableFinder::find` on PATH.
