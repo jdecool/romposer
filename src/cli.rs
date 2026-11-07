@@ -55,6 +55,8 @@ enum Command {
     /// Removes a package from the require or require-dev.
     #[command(visible_alias = "rm")]
     Remove(commands::remove::Args),
+    /// Checks for security vulnerability advisories for installed packages
+    Audit(commands::audit::Args),
     /// Shows a list of installed packages that have updates available, including their latest version.
     Outdated(commands::readonly::OutdatedArgs),
     /// Shows information about licenses of dependencies.
@@ -111,6 +113,7 @@ pub fn run() -> i32 {
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
         Some(Command::Search(args)) => commands::search::run(&args, &mut io),
         Some(Command::Show(args)) => commands::show::run(&args, &mut io),
+        Some(Command::Audit(args)) => commands::audit::run(&args, &mut io),
         Some(Command::Outdated(args)) => commands::readonly::outdated(&args, &mut io),
         Some(Command::Licenses(args)) => commands::readonly::licenses(&args, &mut io),
         Some(Command::Fund(args)) => commands::readonly::fund(&args, &mut io),

@@ -131,6 +131,9 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     options.ignore_all_platform_reqs = args.ignore_platform_reqs;
     options.ignored_platform_reqs = args.ignore_platform_req.clone();
     options.write_lock = config.bool("lock");
+    options.audit = args.audit;
+    options.audit_format = args.audit_format.clone();
+    options.error_on_audit = args.audit;
     let mut installer = Installer {
         io,
         config: &config,

@@ -385,11 +385,35 @@ impl Config {
                 for (k, v) in new {
                     existing.insert(k.clone(), v.clone());
                 }
-                if let (Value::Array(cur), Some(Value::Array(add))) =
-                    (&mut ignores, new.get("ignore"))
-                {
-                    cur.extend(add.iter().cloned());
-                }
+                // `array_merge($currentIgnores, $val['ignore'])`
+                ignores = match (ignores, new.get("ignore")) {
+                    (cur, None) => cur,
+                    (Value::Array(cur), Some(add)) if cur.is_empty() => add.clone(),
+                    (Value::Array(mut cur), Some(Value::Array(add))) => {
+                        cur.extend(add.iter().cloned());
+                        Value::Array(cur)
+                    }
+                    (cur, Some(add)) => {
+                        // ponytail: string keys win, list items get their index as key
+                        let mut merged = Map::new();
+                        for value in [&cur, add] {
+                            match value {
+                                Value::Array(list) => {
+                                    for v in list {
+                                        merged.insert(merged.len().to_string(), v.clone());
+                                    }
+                                }
+                                Value::Object(map) => {
+                                    for (k, v) in map {
+                                        merged.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Value::Object(merged)
+                    }
+                };
                 existing.insert("ignore".into(), ignores);
                 continue;
             }

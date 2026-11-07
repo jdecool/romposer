@@ -16,6 +16,12 @@ pub struct Args {
     /// Removes a package from the require-dev section.
     #[arg(long)]
     pub dev: bool,
+    /// Skip the audit step after updating the composer.lock file (can also be set via the COMPOSER_NO_AUDIT=1 env var).
+    #[arg(long)]
+    pub no_audit: bool,
+    /// Audit output format. Must be "table", "plain", "json", or "summary".
+    #[arg(long, default_value = "summary")]
+    pub audit_format: String,
     /// Outputs the operations but will not execute anything (implicitly enables --verbose).
     #[arg(long)]
     pub dry_run: bool,
@@ -250,6 +256,8 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     options.minimal_update = args.minimal_changes || config.bool("update-with-minimal-changes");
     options.update_allow_transitive = transitive;
     options.write_lock = config.bool("lock");
+    options.audit = crate::commands::audit::enabled(args.no_audit);
+    options.audit_format = args.audit_format.clone();
     if lock.as_ref().is_some_and(|l| l.is_locked()) {
         options.update_allow_list = Some(packages.clone());
     }

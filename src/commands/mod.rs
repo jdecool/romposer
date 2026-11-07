@@ -1,5 +1,6 @@
 //! One module per Composer command.
 
+pub mod audit;
 pub mod check_platform_reqs;
 pub mod depends;
 pub mod dump_autoload;

@@ -156,6 +156,116 @@ struct RootData {
     dist_mirrors: Vec<Value>,
     /// inline `packages` (v1 static repositories, v2 partial packages) and `includes`
     inline: Vec<Map<String, Value>>,
+    /// `security-advisories`: (`metadata`, `api-url`)
+    advisories: Option<(bool, Option<String>)>,
+}
+
+/// `PartialSecurityAdvisory` / `SecurityAdvisory`: a full advisory carries `title`, `sources`
+/// and `reportedAt` in `data`; the partial ones come from the p2 metadata.
+#[derive(Clone, Debug)]
+pub struct Advisory {
+    pub id: String,
+    pub package: String,
+    /// `affectedVersions` as given (the constraint's pretty string)
+    pub affected: String,
+    pub constraint: Constraint,
+    pub data: Map<String, Value>,
+    pub full: bool,
+    /// set by the auditor for an ignored full advisory
+    pub ignore_reason: Option<String>,
+}
+
+impl Advisory {
+    /// `PartialSecurityAdvisory::create`
+    fn create(package: &str, data: &Map<String, Value>) -> Option<Advisory> {
+        let id = data.get("advisoryId")?.as_str()?.to_string();
+        let affected = data.get("affectedVersions")?.as_str()?.to_string();
+        let (constraint, pretty) = match version_parser::parse_constraints(&affected) {
+            Ok(c) => (c, affected.clone()),
+            Err(_) => {
+                static PREFIX: LazyLock<Regex> =
+                    LazyLock::new(|| Regex::new(r"(^[>=<^~]*[\d.]+).*").unwrap());
+                let stripped = PREFIX.replace(&affected, "$1").into_owned();
+                match version_parser::parse_constraints(&stripped) {
+                    Ok(c) => (c, stripped),
+                    Err(_) => (
+                        Constraint::new("==", "0.0.0-invalid-version"),
+                        "== 0.0.0-invalid-version".to_string(),
+                    ),
+                }
+            }
+        };
+        let full = ["title", "sources", "reportedAt"]
+            .iter()
+            .all(|k| data.get(*k).is_some_and(|v| !v.is_null()));
+        Some(Advisory {
+            id,
+            package: package.to_string(),
+            affected: pretty,
+            constraint,
+            data: data.clone(),
+            full,
+            ignore_reason: None,
+        })
+    }
+
+    pub fn str(&self, key: &str) -> Option<&str> {
+        self.data.get(key).and_then(Value::as_str)
+    }
+
+    /// `jsonSerialize`: property order of the PHP classes.
+    pub fn to_json(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("advisoryId".into(), Value::String(self.id.clone()));
+        m.insert("packageName".into(), Value::String(self.package.clone()));
+        m.insert(
+            "affectedVersions".into(),
+            Value::String(self.affected.clone()),
+        );
+        if self.full {
+            for key in ["title", "cve", "link"] {
+                m.insert(
+                    key.into(),
+                    self.data.get(key).cloned().unwrap_or(Value::Null),
+                );
+            }
+            m.insert("reportedAt".into(), Value::String(self.reported_at()));
+            m.insert(
+                "sources".into(),
+                self.data.get("sources").cloned().unwrap_or(Value::Null),
+            );
+            m.insert(
+                "severity".into(),
+                self.data.get("severity").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(reason) = &self.ignore_reason {
+                m.insert("ignoreReason".into(), Value::String(reason.clone()));
+            }
+        }
+        Value::Object(m)
+    }
+
+    /// `new DateTimeImmutable($reportedAt, UTC)->format(DATE_RFC3339)`
+    pub fn reported_at(&self) -> String {
+        static DATE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$",
+            )
+            .unwrap()
+        });
+        let raw = self.str("reportedAt").unwrap_or("");
+        // ponytail: only the `Y-m-d H:i:s` shape Packagist emits, taken as UTC
+        match DATE.captures(raw) {
+            Some(c) => format!(
+                "{}T{}{}",
+                &c[1],
+                &c[2],
+                c.get(3)
+                    .map_or("+00:00".to_string(), |z| z.as_str().replace('Z', "+00:00"))
+            ),
+            None => raw.to_string(),
+        }
+    }
 }
 
 pub struct ComposerRepository {
@@ -545,6 +655,20 @@ impl ComposerRepository {
             }
         }
         let inline = self.load_includes(io, &data)?;
+        let mut advisories = None;
+        if let Some(Value::Object(config)) = data.get("security-advisories") {
+            let api_url = config
+                .get("api-url")
+                .and_then(Value::as_str)
+                .map(|u| self.canonicalize_url(u));
+            if api_url.is_none() && available.is_none() && patterns.is_empty() {
+                return Err(format!(
+                    "Invalid security advisory configuration on composer repo ({}): If the repository does not provide a security-advisories.api-url then available-packages or available-package-patterns are required to be provided for performance reason.",
+                    sanitize_url(&self.url)
+                ));
+            }
+            advisories = Some((config.get("metadata").is_some_and(truthy), api_url));
+        }
         Ok(RootData {
             metadata_url,
             search_url,
@@ -554,6 +678,7 @@ impl ComposerRepository {
             patterns,
             dist_mirrors,
             inline,
+            advisories,
         })
     }
 
@@ -689,6 +814,187 @@ impl ComposerRepository {
     }
 
     /// `loadPackages`: (names found, packages) for the v2 protocol or a static repository.
+    /// `startCachedAsyncDownload` for every `%package%` file at once: the cache answers
+    /// fresh and 404 urls, conditional requests revalidate the rest; `None` when missing.
+    fn fetch_provider_files(
+        &mut self,
+        io: &mut Io,
+        files: &[String],
+    ) -> Result<Vec<Option<Map<String, Value>>>, String> {
+        let metadata_url = self.root.as_ref().unwrap().metadata_url.clone().unwrap();
+        let mut requests = Vec::new();
+        let mut cached: Vec<Option<Map<String, Value>>> = Vec::new();
+        for file in files {
+            let url = metadata_url.replace("%package%", file);
+            let key = format!("provider-{}.json", file.replace('/', "~"));
+            let contents = self
+                .cache_read(&key)
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                .and_then(|v| v.as_object().cloned());
+            let last_modified = contents
+                .as_ref()
+                .and_then(|c| c.get("last-modified"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mut headers = Vec::new();
+            if let Some(lm) = &last_modified {
+                headers.push(("If-Modified-Since".to_string(), lm.clone()));
+            }
+            let skip = self.not_found.contains(&url)
+                || (self.fresh.contains(&url) && last_modified.is_some());
+            cached.push(contents);
+            requests.push((url, key, headers, skip, last_modified.is_some()));
+        }
+        let responses = self.http.get_all(
+            requests
+                .iter()
+                .filter(|r| !r.3)
+                .map(|r| (r.0.clone(), r.2.clone()))
+                .collect(),
+        );
+        let mut responses = responses.into_iter();
+        let mut out = Vec::new();
+        for (i, (url, key, _, skip, had_cache)) in requests.into_iter().enumerate() {
+            let data = if skip {
+                if self.not_found.contains(&url) {
+                    None
+                } else {
+                    cached[i].take()
+                }
+            } else {
+                match responses.next().unwrap() {
+                    Ok(response) if response.status == 304 && response.body.is_empty() => {
+                        self.fresh.insert(url.clone());
+                        cached[i].take()
+                    }
+                    Ok(response) => {
+                        let mut data = Self::decode(&url, &response.body)?;
+                        let mut json = String::from_utf8_lossy(&response.body).into_owned();
+                        if let Some(lm) = &response.last_modified {
+                            data.insert("last-modified".into(), Value::String(lm.clone()));
+                            json = encode(&Value::Object(data.clone()), false, true, true);
+                        }
+                        self.cache_write(&key, &json);
+                        self.fresh.insert(url.clone());
+                        Some(data)
+                    }
+                    Err((Some(404), _)) => {
+                        self.not_found.insert(url.clone());
+                        None
+                    }
+                    Err((_, message)) => {
+                        self.degraded_warning(io, &message);
+                        if had_cache {
+                            cached[i].take()
+                        } else {
+                            return Err(message);
+                        }
+                    }
+                }
+            };
+            out.push(data);
+        }
+        Ok(out)
+    }
+
+    /// `hasSecurityAdvisories`
+    pub fn has_security_advisories(&mut self, io: &mut Io) -> Result<bool, String> {
+        let root = self.load_root(io, Some(600))?;
+        Ok(root
+            .advisories
+            .as_ref()
+            .is_some_and(|(metadata, api)| *metadata || api.is_some()))
+    }
+
+    /// `getSecurityAdvisories`: the advisories matching each package's constraint, read
+    /// from the p2 metadata when partial ones are allowed (or no API exists), the rest
+    /// asked from the `api-url` in batches.
+    pub fn get_security_advisories(
+        &mut self,
+        io: &mut Io,
+        constraints: &BTreeMap<String, Constraint>,
+        allow_partial: bool,
+    ) -> Result<BTreeMap<String, Vec<Advisory>>, String> {
+        self.load_root(io, Some(600))?;
+        let Some((metadata, api_url)) = self.root.as_ref().unwrap().advisories.clone() else {
+            return Ok(BTreeMap::new());
+        };
+        let mut pending: BTreeMap<String, Constraint> = constraints
+            .iter()
+            .filter(|(name, _)| !self.has_available_list() || self.contains(name))
+            .map(|(n, c)| (n.clone(), c.clone()))
+            .collect();
+        let mut advisories = BTreeMap::new();
+        let mut collect =
+            |name: &str, list: &[Value], pending: &mut BTreeMap<String, Constraint>| {
+                let Some(constraint) = pending.remove(name) else {
+                    return;
+                };
+                let matching: Vec<Advisory> = list
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(|data| Advisory::create(name, data))
+                    .filter(|a| a.constraint.matches(&constraint))
+                    .collect();
+                if !matching.is_empty() {
+                    advisories.insert(name.to_string(), matching);
+                }
+            };
+        if metadata && (allow_partial || api_url.is_none()) {
+            let names: Vec<String> = pending
+                .keys()
+                .filter(|n| !is_platform_package(n) && n.as_str() != "__root__")
+                .cloned()
+                .collect();
+            let files = self.fetch_provider_files(io, &names)?;
+            for (name, file) in names.iter().zip(files) {
+                if let Some(Value::Array(list)) =
+                    file.and_then(|f| f.get("security-advisories").cloned())
+                {
+                    collect(name, &list, &mut pending);
+                }
+            }
+        }
+        if let Some(api_url) = api_url
+            && !pending.is_empty()
+        {
+            let names: Vec<String> = pending.keys().cloned().collect();
+            for batch in names.chunks(500) {
+                let body = batch
+                    .iter()
+                    .map(|n| format!("packages%5B%5D={}", n.replace('/', "%2F")))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let response = self
+                    .http
+                    .post_form(&api_url, &body)
+                    .map_err(|(_, message)| message)?;
+                let data = Self::decode(&api_url, &response.body)?;
+                let Some(Value::Object(by_name)) = data.get("advisories") else {
+                    continue;
+                };
+                for (name, list) in by_name {
+                    if !pending.contains_key(name) {
+                        io.warning(&format!(
+                            "composer repo ({}) returned names which were not requested in response to the security-advisories API. {name} was not requested but is present in the response. Requested names were: {}",
+                            sanitize_url(&self.url),
+                            if names.len() > 20 {
+                                format!("{} and {} more", names[..20].join(", "), names.len() - 20)
+                            } else {
+                                names.join(", ")
+                            }
+                        ));
+                        continue;
+                    }
+                    if let Value::Array(list) = list {
+                        collect(name, list, &mut pending);
+                    }
+                }
+            }
+        }
+        Ok(advisories)
+    }
+
     pub fn load_packages_filtered(
         &mut self,
         io: &mut Io,
@@ -748,7 +1054,6 @@ impl ComposerRepository {
             }
             return Ok((found, packages));
         }
-        let metadata_url = root.metadata_url.clone().unwrap();
         let only_dev = acceptable == [Stability::Dev] && flags.is_empty();
         let mut jobs: Vec<(String, String, Option<Constraint>)> = Vec::new();
         for (name, constraint) in names {
@@ -773,39 +1078,9 @@ impl ComposerRepository {
         }
         // partial packages inlined in packages.json win over the lazy files
         let inline = root.inline.clone();
-        let mut requests = Vec::new();
-        let mut cached: Vec<Option<Map<String, Value>>> = Vec::new();
-        for (file, _, _) in &jobs {
-            let url = metadata_url.replace("%package%", file);
-            let key = format!("provider-{}.json", file.replace('/', "~"));
-            let contents = self
-                .cache_read(&key)
-                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-                .and_then(|v| v.as_object().cloned());
-            let last_modified = contents
-                .as_ref()
-                .and_then(|c| c.get("last-modified"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let mut headers = Vec::new();
-            if let Some(lm) = &last_modified {
-                headers.push(("If-Modified-Since".to_string(), lm.clone()));
-            }
-            let skip = self.not_found.contains(&url)
-                || (self.fresh.contains(&url) && last_modified.is_some());
-            cached.push(contents);
-            requests.push((url, key, headers, skip, last_modified.is_some()));
-        }
-        let responses = self.http.get_all(
-            requests
-                .iter()
-                .filter(|r| !r.3)
-                .map(|r| (r.0.clone(), r.2.clone()))
-                .collect(),
-        );
-        let mut responses = responses.into_iter();
-        for (i, (file, real_name, constraint)) in jobs.into_iter().enumerate() {
-            let (url, key, _, skip, had_cache) = requests[i].clone();
+        let files: Vec<String> = jobs.iter().map(|(file, _, _)| file.clone()).collect();
+        let fetched = self.fetch_provider_files(io, &files)?;
+        for ((file, real_name, constraint), fetched) in jobs.into_iter().zip(fetched) {
             let inline_versions: Vec<Map<String, Value>> = inline
                 .iter()
                 .filter(|m| {
@@ -827,42 +1102,8 @@ impl ComposerRepository {
                 );
                 m.insert("packages".into(), Value::Object(by_name));
                 Some(m)
-            } else if skip {
-                if self.not_found.contains(&url) {
-                    None
-                } else {
-                    cached[i].clone()
-                }
             } else {
-                match responses.next().unwrap() {
-                    Ok(response) if response.status == 304 && response.body.is_empty() => {
-                        self.fresh.insert(url.clone());
-                        cached[i].clone()
-                    }
-                    Ok(response) => {
-                        let mut data = Self::decode(&url, &response.body)?;
-                        let mut json = String::from_utf8_lossy(&response.body).into_owned();
-                        if let Some(lm) = &response.last_modified {
-                            data.insert("last-modified".into(), Value::String(lm.clone()));
-                            json = encode(&Value::Object(data.clone()), false, true, true);
-                        }
-                        self.cache_write(&key, &json);
-                        self.fresh.insert(url.clone());
-                        Some(data)
-                    }
-                    Err((Some(404), _)) => {
-                        self.not_found.insert(url.clone());
-                        None
-                    }
-                    Err((_, message)) => {
-                        self.degraded_warning(io, &message);
-                        if had_cache {
-                            cached[i].clone()
-                        } else {
-                            return Err(message);
-                        }
-                    }
-                }
+                fetched
             };
             let Some(data) = data else { continue };
             let Some(versions) = data

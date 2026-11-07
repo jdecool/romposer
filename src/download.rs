@@ -867,6 +867,17 @@ pub async fn http_get(
     url: &str,
     headers: &[(String, String)],
 ) -> Result<HttpResponse, (Option<u16>, String)> {
+    http_request(client, config, url, headers, None).await
+}
+
+/// `http_get`, or a POST with a form-encoded `body`.
+pub async fn http_request(
+    client: &reqwest::Client,
+    config: &Config,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<HttpResponse, (Option<u16>, String)> {
     let mut url = url.to_string();
     for _ in 0..=20 {
         if url.starts_with("http://") && config.bool("secure-http") {
@@ -878,7 +889,13 @@ pub async fn http_get(
                 ),
             ));
         }
-        let mut request = client.get(&url);
+        let mut request = match body {
+            Some(body) => client
+                .post(&url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.to_string()),
+            None => client.get(&url),
+        };
         let origin = origin(config, &url);
         if let Some(auth) = config.authentication(&origin) {
             for (k, v) in auth_headers(config, &origin, &url, &auth) {
@@ -981,6 +998,16 @@ impl Http {
     ) -> Result<HttpResponse, (Option<u16>, String)> {
         self.runtime
             .block_on(http_get(&self.client, &self.config, url, headers))
+    }
+
+    pub fn post_form(&self, url: &str, body: &str) -> Result<HttpResponse, (Option<u16>, String)> {
+        self.runtime.block_on(http_request(
+            &self.client,
+            &self.config,
+            url,
+            &[],
+            Some(body),
+        ))
     }
 
     /// Every request in parallel, results in request order.

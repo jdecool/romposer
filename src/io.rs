@@ -29,16 +29,18 @@ impl Io {
     }
 
     pub fn write(&mut self, line: &str) {
+        let line = Self::clean(line);
         if let Some(buffer) = &mut self.buffer {
-            buffer.push(line.to_string());
+            buffer.push(line);
         } else if !self.quiet {
             let _ = writeln!(std::io::stdout(), "{line}");
         }
     }
 
     pub fn error(&mut self, line: &str) {
+        let line = Self::clean(line);
         if let Some(buffer) = &mut self.buffer {
-            buffer.push(line.to_string());
+            buffer.push(line);
         } else if !self.quiet {
             let _ = writeln!(std::io::stderr(), "{line}");
         }
@@ -54,10 +56,11 @@ impl Io {
         }
     }
 
-    /// Repository-supplied text with control characters (terminal escapes) removed.
+    /// Text with control characters (terminal escapes) removed; every printed line goes
+    /// through this, since package metadata from repositories ends up in the output.
     pub fn clean(text: &str) -> String {
         text.chars()
-            .filter(|c| !c.is_control() || *c == '\t')
+            .filter(|c| !c.is_control() || matches!(c, '\t' | '\n'))
             .collect()
     }
 

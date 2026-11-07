@@ -378,6 +378,8 @@ fn run_inner(fixture: &Fixture) -> Outcome {
     let mut executor = TraceExecutor::default();
     let has = |flag: &str| flags.contains(&flag);
     let mut options = Options::defaults();
+    // InstallerTest: `setAuditConfig(new AuditConfig(false))`
+    options.audit = false;
     options.write_lock = config.bool("lock");
     options.dev_mode = !has("--no-dev");
     options.dry_run = has("--dry-run");

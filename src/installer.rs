@@ -15,6 +15,7 @@ use crate::package::Package;
 use crate::package::root::AliasDef;
 use crate::package::root::RootPackage;
 use crate::platform::{PhpInfo, PlatformRepository, RequirementFilter};
+use crate::repository::ComposerRepository;
 use crate::semver::{Constraint, Stability, parse_stability};
 use crate::solver::builder::{ArrayRepo, Repository, RepositorySet};
 use crate::solver::lock_transaction::LockTransaction;
@@ -69,6 +70,10 @@ pub struct Options {
     pub temporary_constraints: Vec<(String, Constraint, String)>,
     pub write_lock: bool,
     pub execute_operations: bool,
+    pub audit: bool,
+    pub audit_format: String,
+    /// `install --audit`: advisories fail the command
+    pub error_on_audit: bool,
 }
 
 impl Options {
@@ -94,6 +99,9 @@ impl Options {
             install: true,
             update_mirrors: false,
             update_allow_list: None,
+            audit: true,
+            audit_format: "summary".into(),
+            error_on_audit: false,
             update_allow_transitive: solver::UPDATE_ONLY_LISTED,
             prefer_stable: false,
             prefer_lowest: false,
@@ -329,6 +337,34 @@ impl<'a> Installer<'a> {
             ));
             self.io
                 .error("Use the `composer fund` command to find out more!");
+        }
+
+        if self.options.audit {
+            let (packages, target) = if self.options.update && !self.options.install {
+                let lock = self.locked().ok_or("No lock file")?;
+                (lock.locked_packages(self.options.dev_mode)?, "locked")
+            } else {
+                (local_repo.packages.clone(), "installed")
+            };
+            let mut repos: Vec<&mut ComposerRepository> = self
+                .repos
+                .iter_mut()
+                .filter_map(|r| match r {
+                    Repository::Composer(repo) => Some(&mut **repo),
+                    _ => None,
+                })
+                .collect();
+            let failed = crate::commands::audit::after_install(
+                self.io,
+                self.config,
+                &mut repos,
+                &packages,
+                target,
+                &self.options.audit_format,
+            )?;
+            if failed && self.options.error_on_audit {
+                return Ok(ERROR_AUDIT_FAILED);
+            }
         }
         Ok(0)
     }

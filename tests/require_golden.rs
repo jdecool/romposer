@@ -1,5 +1,5 @@
 //! `romposer require` / `remove` against composer 2.11.1 on live Packagist: identical
-//! composer.json, composer.lock and stderr (audit lines aside, ticket 13).
+//! composer.json, composer.lock, stdout and stderr.
 
 mod common;
 
@@ -12,9 +12,7 @@ fn comparable(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .filter(|l| {
-            !l.contains("security vulnerability")
-                && !l.contains("skipping audit")
-                && !l.contains("could not detect the root package")
+            !l.contains("could not detect the root package")
                 && !l.starts_with("  - Downloading")
                 && !l.starts_with("  - Installing")
                 && !l.starts_with("  - Upgrading")
@@ -61,6 +59,13 @@ fn compare(
     }
     if theirs_lock != ours_lock {
         failures.push(format!("{args:?}: composer.lock differs"));
+    }
+    if theirs.stdout != ours.stdout {
+        failures.push(format!(
+            "{args:?}: stdout differs\n--- composer\n{}\n--- romposer\n{}",
+            String::from_utf8_lossy(&theirs.stdout),
+            String::from_utf8_lossy(&ours.stdout)
+        ));
     }
     if ours.status.success() {
         let (t, o) = (comparable(&theirs.stderr), comparable(&ours.stderr));

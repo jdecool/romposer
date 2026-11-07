@@ -15,6 +15,7 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 | Composer installer fixtures passing | 194/228 (the rest need dependency policies, path repositories or a composer repository served from a directory) |
 | `update` lock vs composer | byte-identical on a live monolog + symfony/console + phpunit project (full, `--no-dev`, `--prefer-lowest`, `--lock`, partial) |
 | `show` / `search` golden cases vs composer | 31 on a recorded Packagist + live `show symfony/console -a --format=json` |
+| `audit` vs composer | 30 invocations identical (every format, `--locked`, installed, ignore rules, `install --audit`) on a live project pinning a vulnerable guzzle |
 | `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
 
 ## Install

@@ -6,13 +6,12 @@ mod common;
 use common::{composer, romposer, run, temp_dir};
 use std::path::Path;
 
-/// Lines Composer prints that romposer does not have yet (audit, ticket 13) or that depend on git.
+/// Lines that depend on git or on the download order.
 fn comparable(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .filter(|l| {
-            !l.contains("security vulnerability")
-                && !l.contains("could not detect the root package")
+            !l.contains("could not detect the root package")
                 && !l.starts_with("Downloading ")
                 && !l.starts_with("  - Downloading")
                 && !l.starts_with("  - Installing")
@@ -52,6 +51,13 @@ fn compare_update(dir: &Path, composer: &Path, args: &[&str]) -> Vec<String> {
     if t != o {
         failures.push(format!(
             "{args:?}: stderr differs\n--- composer\n{t}\n--- romposer\n{o}"
+        ));
+    }
+    if theirs.stdout != ours.stdout {
+        failures.push(format!(
+            "{args:?}: stdout differs\n--- composer\n{}\n--- romposer\n{}",
+            String::from_utf8_lossy(&theirs.stdout),
+            String::from_utf8_lossy(&ours.stdout)
         ));
     }
     failures
