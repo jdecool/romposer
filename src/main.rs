@@ -1,7 +1,7 @@
 use clap::Parser;
 
 /// Composer version whose observable behaviour romposer reproduces.
-pub const COMPOSER_VERSION: &str = "2.11.1";
+pub use romposer::COMPOSER_VERSION;
 
 const VERSION_LINE: &str = concat!(
     "Romposer ",
