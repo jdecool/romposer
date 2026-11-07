@@ -953,6 +953,14 @@ async fn fetch_once(
     // local paths and file:// URLs (artifact repositories) are copied, as RemoteFilesystem does
     if !Regex::new(r"(?i)^https?://").unwrap().is_match(url) {
         let local = url.strip_prefix("file://").unwrap_or(url);
+        // ponytail: any repository may name a local dist, as in Composer; only regular files
+        // are copied (no /dev/zero or FIFO), restrict to local repositories if that matters
+        if !std::fs::metadata(local).is_ok_and(|m| m.is_file()) {
+            return Err((
+                Some(404),
+                format!("The \"{url}\" file could not be downloaded (not a regular file)"),
+            ));
+        }
         return std::fs::copy(local, file_name).map(|_| ()).map_err(|e| {
             (
                 Some(404),
