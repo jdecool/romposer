@@ -49,6 +49,23 @@ pub struct Options {
     pub ignored_platform_reqs: Vec<String>,
 }
 
+/// Runs the operations of a transaction: on the filesystem, or as a trace (fixtures).
+pub trait Executor {
+    fn execute(
+        &mut self,
+        io: &mut Io,
+        config: &Config,
+        root: &RootPackage,
+        local_repo: &mut InstalledRepository,
+        operations: &[Operation],
+        options: &Options,
+    ) -> Result<(), String>;
+    /// Whether vendor/ exists for this executor (autoload dump, binaries).
+    fn writes_files(&self) -> bool {
+        true
+    }
+}
+
 pub struct Installer<'a> {
     pub io: &'a mut Io,
     pub config: &'a Config,
@@ -56,6 +73,7 @@ pub struct Installer<'a> {
     pub lock: &'a Lock,
     pub composer_json: &'a str,
     pub options: Options,
+    pub executor: &'a mut dyn Executor,
 }
 
 /// `LibraryInstaller::getInstallPath`
@@ -100,13 +118,18 @@ struct StoreRun {
 }
 
 impl Installer<'_> {
-    /// `Installer::run` when a lock file exists.
+    /// `Installer::run` when a lock file exists, on the project's installed.json.
     pub fn run(&mut self) -> Result<i32, String> {
         let vendor_dir = self.config.vendor_dir();
         let installed_path = PathBuf::from(format!("{vendor_dir}/composer/installed.json"));
         let mut local_repo = InstalledRepository::read(&installed_path)?;
+        self.run_with(&mut local_repo)
+    }
 
-        let code = self.do_install(&mut local_repo, &vendor_dir)?;
+    /// `Installer::run` on a given local repository (the fixture runner's in-memory one).
+    pub fn run_with(&mut self, local_repo: &mut InstalledRepository) -> Result<i32, String> {
+        let vendor_dir = self.config.vendor_dir();
+        let code = self.do_install(local_repo, &vendor_dir)?;
         if code != 0 {
             return Ok(code);
         }
@@ -146,7 +169,7 @@ impl Installer<'_> {
             let class_map = crate::autoload::dump(
                 self.io,
                 self.config,
-                &local_repo,
+                local_repo,
                 self.root,
                 Some(self.lock),
                 &options,
@@ -194,21 +217,6 @@ impl Installer<'_> {
         }
     }
 
-    fn store_run(&self, vendor_dir: &str) -> Result<Option<StoreRun>, String> {
-        let config =
-            StoreConfig::from_root(&self.root.package.extra, &self.config.get_str("cache-dir"))?;
-        if !config.enabled {
-            return Ok(None);
-        }
-        let store = Store::new(&config.root);
-        Ok(Some(StoreRun {
-            config,
-            store,
-            manifest: Manifest::in_vendor_dir(vendor_dir),
-            fallback_warned: false,
-        }))
-    }
-
     /// `Installer::doInstall`
     fn do_install(
         &mut self,
@@ -236,7 +244,7 @@ impl Installer<'_> {
         self.io
             .error("Verifying lock file contents can be installed on current platform.");
         if !self.lock.is_fresh(self.composer_json) {
-            self.io.error("Warning: The lock file is not up to date with the latest changes in composer.json. You may be getting outdated dependencies. It is recommended that you run `composer update` or `composer update <package name>`.");
+            self.io.warning("Warning: The lock file is not up to date with the latest changes in composer.json. You may be getting outdated dependencies. It is recommended that you run `composer update` or `composer update <package name>`.");
         }
         let missing = self
             .lock
@@ -306,7 +314,14 @@ impl Installer<'_> {
         }
 
         local_repo.dev_package_names = self.lock.dev_package_names();
-        self.execute(local_repo, &operations, vendor_dir)?;
+        self.executor.execute(
+            self.io,
+            self.config,
+            self.root,
+            local_repo,
+            &operations,
+            &self.options,
+        )?;
         if !operations.is_empty() {
             let vendor = Path::new(vendor_dir);
             if vendor.is_dir() {
@@ -315,6 +330,62 @@ impl Installer<'_> {
             }
         }
         Ok(0)
+    }
+}
+
+/// The real `InstallationManager`: downloads, store or archive extraction, binaries, installed.json.
+pub struct FilesystemExecutor;
+
+impl Executor for FilesystemExecutor {
+    fn execute(
+        &mut self,
+        io: &mut Io,
+        config: &Config,
+        root: &RootPackage,
+        local_repo: &mut InstalledRepository,
+        operations: &[Operation],
+        options: &Options,
+    ) -> Result<(), String> {
+        let vendor_dir = config.vendor_dir();
+        let mut run = FilesystemRun {
+            io,
+            config,
+            root,
+            options,
+        };
+        run.execute(local_repo, operations, &vendor_dir)
+    }
+}
+
+struct FilesystemRun<'a> {
+    io: &'a mut Io,
+    config: &'a Config,
+    root: &'a RootPackage,
+    options: &'a Options,
+}
+
+impl FilesystemRun<'_> {
+    fn binary_installer(&self) -> BinaryInstaller {
+        BinaryInstaller {
+            bin_dir: self.config.get_str("bin-dir"),
+            bin_compat: self.config.get_str("bin-compat"),
+            vendor_dir: self.config.vendor_dir(),
+        }
+    }
+
+    fn store_run(&self, vendor_dir: &str) -> Result<Option<StoreRun>, String> {
+        let config =
+            StoreConfig::from_root(&self.root.package.extra, &self.config.get_str("cache-dir"))?;
+        if !config.enabled {
+            return Ok(None);
+        }
+        let store = Store::new(&config.root);
+        Ok(Some(StoreRun {
+            config,
+            store,
+            manifest: Manifest::in_vendor_dir(vendor_dir),
+            fallback_warned: false,
+        }))
     }
 
     /// `InstalledRepository::write` with `$dumpVersions`: installed.json, installed.php, InstalledVersions.php.

@@ -7,6 +7,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod download;
+pub mod fixtures;
 pub mod fs;
 pub mod installed;
 pub mod installer;

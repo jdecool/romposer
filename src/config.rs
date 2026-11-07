@@ -201,6 +201,25 @@ fn defaults() -> Map<String, Value> {
 }
 
 impl Config {
+    /// `FactoryMock::createConfig`: defaults with a throwaway home and no packagist, nothing read from disk.
+    pub fn in_memory() -> Config {
+        let mut config = Config {
+            config: defaults(),
+            repositories: vec![],
+            base_dir: None,
+        };
+        let home = std::env::temp_dir()
+            .join("romposer-in-memory-home")
+            .to_string_lossy()
+            .into_owned();
+        let mut dirs = Map::new();
+        dirs.insert("home".into(), Value::String(home.clone()));
+        dirs.insert("cache-dir".into(), Value::String(format!("{home}/cache")));
+        dirs.insert("data-dir".into(), Value::String(home));
+        config.merge_config(&dirs);
+        config
+    }
+
     /// `Factory::createConfig`: defaults, dirs, global config.json and auth.json, COMPOSER_AUTH.
     pub fn create(cwd: &str) -> Result<Config, String> {
         let mut config = Config {

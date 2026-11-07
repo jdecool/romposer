@@ -157,6 +157,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     };
 
     let dev_mode = !args.no_dev;
+    let mut executor = crate::installer::FilesystemExecutor;
     let mut installer = Installer {
         io,
         config: &config,
@@ -187,6 +188,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             ignore_all_platform_reqs: args.ignore_platform_reqs,
             ignored_platform_reqs: args.ignore_platform_req.clone(),
         },
+        executor: &mut executor,
     };
     installer.run()
 }

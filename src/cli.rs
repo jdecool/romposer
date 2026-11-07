@@ -70,10 +70,7 @@ pub fn run() -> i32 {
         eprintln!("Invalid working directory specified, {dir} does not exist. ({e})");
         return 1;
     }
-    let mut io = Io {
-        quiet: cli.quiet,
-        verbosity: cli.verbose,
-    };
+    let mut io = Io::new(cli.quiet, cli.verbose);
     match cli.command {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),

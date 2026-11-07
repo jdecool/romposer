@@ -12,7 +12,7 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 
 | Metric | Value |
 |---|---|
-| Composer installer fixtures passing | _not measured yet_ |
+| Composer installer fixtures passing | 13/228 (every install-from-lock fixture; the rest need the resolver, slice 2) |
 | `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
 
 ## Install

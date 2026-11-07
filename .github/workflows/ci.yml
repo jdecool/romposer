@@ -24,3 +24,5 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
+      - name: Installer fixtures pass rate
+        run: cargo test --test installer_fixtures -- --nocapture 2>&1 | grep "fixtures passing"

@@ -610,29 +610,44 @@ pub fn branch_alias(config: &Map<String, Value>) -> Result<Option<String>, Strin
     if !version.starts_with("dev-") && !version.ends_with("-dev") {
         return Ok(None);
     }
-    let Some(Value::Object(aliases)) = config.get("extra").and_then(|e| e.get("branch-alias"))
-    else {
-        return Ok(None);
-    };
-    for (source_branch, target_branch) in aliases {
-        let Some(target_branch) = target_branch.as_str() else {
-            continue;
-        };
-        if !target_branch.ends_with("-dev") {
-            continue;
-        }
-        let validated = if target_branch == semver::DEFAULT_BRANCH_ALIAS {
-            semver::DEFAULT_BRANCH_ALIAS.to_string()
-        } else {
-            semver::normalize_branch(&target_branch[..target_branch.len() - 4])
-        };
-        if !validated.ends_with("-dev") {
-            continue;
-        }
-        // ensure that it is the current branch aliasing itself
-        if version.to_lowercase() == source_branch.to_lowercase() {
+    if let Some(Value::Object(aliases)) = config.get("extra").and_then(|e| e.get("branch-alias")) {
+        for (source_branch, target_branch) in aliases {
+            let Some(target_branch) = target_branch.as_str() else {
+                continue;
+            };
+            if !target_branch.ends_with("-dev") {
+                continue;
+            }
+            let validated = if target_branch == semver::DEFAULT_BRANCH_ALIAS {
+                semver::DEFAULT_BRANCH_ALIAS.to_string()
+            } else {
+                semver::normalize_branch(&target_branch[..target_branch.len() - 4])
+            };
+            if !validated.ends_with("-dev") {
+                continue;
+            }
+            // ensure that it is the current branch aliasing itself
+            if version.to_lowercase() != source_branch.to_lowercase() {
+                continue;
+            }
+            // ensure that it is a numeric alias of a valid sub-version
+            if let (Some(source_prefix), Some(target_prefix)) = (
+                semver::parse_numeric_alias_prefix(source_branch),
+                semver::parse_numeric_alias_prefix(target_branch),
+            ) && !target_prefix
+                .to_lowercase()
+                .starts_with(&source_prefix.to_lowercase())
+            {
+                continue;
+            }
             return Ok(Some(validated));
         }
+    }
+    // the default branch is aliased to 9999999-dev when it is not already a numeric branch
+    if config.get("default-branch") == Some(&Value::Bool(true))
+        && semver::parse_numeric_alias_prefix(version.trim_start_matches('v')).is_none()
+    {
+        return Ok(Some(semver::DEFAULT_BRANCH_ALIAS.to_string()));
     }
     Ok(None)
 }
