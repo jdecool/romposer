@@ -34,12 +34,6 @@ pub struct Args {
     /// Disables autoload-dev rules.
     #[arg(long)]
     pub no_dev: bool,
-    /// Skips the execution of all scripts defined in composer.json file.
-    #[arg(long)]
-    pub no_scripts: bool,
-    /// Whether to disable plugins.
-    #[arg(long)]
-    pub no_plugins: bool,
     /// Ignore a specific platform requirement (php & ext- packages).
     #[arg(long)]
     pub ignore_platform_req: Vec<String>,
@@ -57,10 +51,7 @@ pub struct Args {
 pub fn run(args: &Args, io: &mut Io) -> i32 {
     match execute(args, io) {
         Ok(code) => code,
-        Err(message) => {
-            io.error(&message);
-            1
-        }
+        Err(message) => crate::scripts::exit_code(io, &message),
     }
 }
 
@@ -193,6 +184,7 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
             None
         },
         dry_run: args.dry_run,
+        run_scripts: true,
         strict_ambiguous: args.strict_ambiguous,
         ignore_all_platform_reqs: args.ignore_platform_reqs,
         ignored_platform_reqs: args.ignore_platform_req.clone(),

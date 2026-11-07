@@ -49,9 +49,6 @@ pub struct Args {
     /// Audit output format. Must be "table", "plain", "json", or "summary".
     #[arg(long, default_value = "summary")]
     pub audit_format: String,
-    /// Skips the execution of all scripts defined in composer.json file.
-    #[arg(long)]
-    pub no_scripts: bool,
     /// Skips autoloader generation
     #[arg(long)]
     pub no_autoloader: bool,
@@ -99,10 +96,7 @@ pub struct Args {
 pub fn run(args: &Args, io: &mut Io) -> i32 {
     match execute(args, io) {
         Ok(code) => code,
-        Err(message) => {
-            io.error(&message);
-            1
-        }
+        Err(message) => crate::scripts::exit_code(io, &message),
     }
 }
 
@@ -212,7 +206,6 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         || args.apcu_autoloader_prefix.is_some()
         || config.bool("apcu-autoloader");
     options.apcu_autoloader_prefix = args.apcu_autoloader_prefix.clone();
-    options.run_scripts = !args.no_scripts;
     options.strict_psr_autoloader =
         args.strict_psr_autoloader || config.bool("strict-psr-autoloader");
     if options.strict_psr_autoloader

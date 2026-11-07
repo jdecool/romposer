@@ -35,6 +35,12 @@ pub struct Cli {
     /// If specified, use the given directory as working directory.
     #[arg(short = 'd', long, global = true)]
     working_dir: Option<String>,
+    /// Whether to disable plugins.
+    #[arg(long, global = true)]
+    no_plugins: bool,
+    /// Skips the execution of all scripts defined in composer.json file.
+    #[arg(long, global = true)]
+    no_scripts: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -87,6 +93,14 @@ enum Command {
     /// Inspect and maintain the shared package store
     #[command(subcommand)]
     Store(commands::store::Command),
+    /// Runs the scripts defined in composer.json
+    #[command(name = "run-script", visible_alias = "run")]
+    RunScript(commands::run_script::RunScriptArgs),
+    /// Executes a vendored binary/script.
+    Exec(commands::run_script::ExecArgs),
+    /// A script of composer.json run as its own command (`ScriptAliasCommand`).
+    #[command(external_subcommand)]
+    Script(Vec<String>),
 }
 
 /// Runs the CLI and returns the process exit code.
@@ -102,6 +116,11 @@ pub fn run() -> i32 {
         eprintln!("Invalid working directory specified, {dir} does not exist. ({e})");
         return 1;
     }
+    // `Factory::createComposer`: `--no-scripts` disables the event dispatcher's scripts
+    if cli.no_scripts {
+        crate::scripts::RUN_SCRIPTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    crate::scripts::NO_PLUGINS.store(cli.no_plugins, std::sync::atomic::Ordering::Relaxed);
     let mut io = Io::new(cli.quiet, cli.verbose);
     match cli.command {
         Some(Command::Validate(args)) => commands::validate::run(&args, &mut io),
@@ -121,6 +140,9 @@ pub fn run() -> i32 {
         Some(Command::Status(args)) => commands::readonly::status(&args, &mut io),
         Some(Command::Depends(args)) => commands::depends::depends(&args, &mut io),
         Some(Command::Prohibits(args)) => commands::depends::prohibits(&args, &mut io),
+        Some(Command::RunScript(args)) => commands::run_script::run_script(&args, &mut io),
+        Some(Command::Exec(args)) => commands::run_script::exec(&args, &mut io),
+        Some(Command::Script(argv)) => commands::run_script::alias(&argv[0], &argv[1..], &mut io),
         Some(Command::CheckPlatformReqs(args)) => {
             commands::check_platform_reqs::run(&args, &mut io)
         }

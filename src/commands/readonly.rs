@@ -17,10 +17,7 @@ use std::path::Path;
 fn fail(io: &mut Io, result: Result<i32, String>) -> i32 {
     match result {
         Ok(code) => code,
-        Err(message) => {
-            io.error(&message);
-            1
-        }
+        Err(message) => crate::scripts::exit_code(io, &message),
     }
 }
 
@@ -506,10 +503,12 @@ pub fn status(_args: &StatusArgs, io: &mut Io) -> i32 {
 }
 
 fn status_inner(io: &mut Io) -> Result<i32, String> {
-    let (_, _, _, config, _) = load_project(io)?;
+    let (_, _, root, config, _) = load_project(io)?;
+    crate::scripts::fire(io, &config, &root, "pre-status-cmd")?;
     let repo = local_repo(&config)?;
     let _ = repo;
     io.error("No local changes");
+    crate::scripts::fire(io, &config, &root, "post-status-cmd")?;
     Ok(0)
 }
 

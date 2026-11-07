@@ -38,6 +38,10 @@ pub const ERROR_AUDIT_FAILED: i32 = 5;
 pub const ERROR_PSR_AUTOLOAD_VIOLATION: i32 = 6;
 pub const ERROR_TRANSPORT_EXCEPTION: i32 = 100;
 
+/// `RequireCommand`'s `pre-operations-exec` listener: past it, a failure keeps composer.json.
+pub static RESOLUTION_COMPLETED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static METADATA_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:\._.*|\.DS_Store|__MACOSX|\.AppleDouble|\.fseventsd|\.Spotlight-V100|\.Trashes|(?i:thumbs\.db|desktop\.ini))$").unwrap()
 });
@@ -248,6 +252,16 @@ impl<'a> Installer<'a> {
         if self.options.update && !self.options.install {
             self.options.dump_autoloader = false;
         }
+        if self.options.run_scripts {
+            let dev = if self.options.dev_mode { "1" } else { "0" };
+            crate::scripts::put_env("COMPOSER_DEV_MODE", Some(dev))?;
+            let event = if self.options.update {
+                "pre-update-cmd"
+            } else {
+                "pre-install-cmd"
+            };
+            crate::scripts::fire(self.io, self.config, self.root, event)?;
+        }
         let vendor_dir = self.config.vendor_dir();
         let code = if self.options.update {
             self.do_update(local_repo, &vendor_dir)?
@@ -294,6 +308,7 @@ impl<'a> Installer<'a> {
                 apcu_prefix: self.options.apcu_autoloader_prefix.clone(),
                 dev_mode: Some(self.options.dev_mode),
                 dry_run: false,
+                run_scripts: self.options.run_scripts,
                 strict_ambiguous: false,
                 ignore_all_platform_reqs: self.options.ignore_all_platform_reqs,
                 ignored_platform_reqs: self.options.ignored_platform_reqs.clone(),
@@ -337,6 +352,15 @@ impl<'a> Installer<'a> {
             ));
             self.io
                 .error("Use the `composer fund` command to find out more!");
+        }
+
+        if self.options.run_scripts {
+            let event = if self.options.update {
+                "post-update-cmd"
+            } else {
+                "post-install-cmd"
+            };
+            crate::scripts::fire(self.io, self.config, self.root, event)?;
         }
 
         if self.options.audit {
@@ -1041,6 +1065,8 @@ impl<'a> Installer<'a> {
         }
 
         let operations = calculate_operations(&local_repo.packages, &locked)?;
+        RESOLUTION_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::scripts::fire(self.io, self.config, self.root, "pre-operations-exec")?;
         let mut installs = Vec::new();
         let mut updates = Vec::new();
         let mut uninstalls = Vec::new();
@@ -1189,6 +1215,13 @@ impl FilesystemRun<'_> {
         }))
     }
 
+    fn fire_post_events(&mut self, events: &mut Vec<&str>) -> Result<(), String> {
+        for event in events.drain(..) {
+            crate::scripts::fire(self.io, self.config, self.root, &format!("post-{event}"))?;
+        }
+        Ok(())
+    }
+
     /// `InstalledRepository::write` with `$dumpVersions`: installed.json, installed.php, InstalledVersions.php.
     fn write_local_repo(
         &self,
@@ -1260,7 +1293,25 @@ impl FilesystemRun<'_> {
             return Ok(());
         }
 
+        // pre events fire as each operation starts, post events once its batch is done; plugins
+        // and installers get a batch of their own
+        let mut post_events: Vec<&str> = Vec::new();
         for op in operations {
+            let (event, plugin) = match op {
+                Operation::Install(p) => ("package-install", Some(p)),
+                Operation::Update { target, .. } => ("package-update", Some(target)),
+                Operation::Uninstall(_) => ("package-uninstall", None),
+                _ => ("", None),
+            };
+            let plugin = plugin
+                .filter(|p| matches!(p.kind.as_str(), "composer-plugin" | "composer-installer"));
+            if plugin.is_some() {
+                self.fire_post_events(&mut post_events)?;
+            }
+            if !event.is_empty() && self.options.run_scripts {
+                crate::scripts::fire(self.io, self.config, self.root, &format!("pre-{event}"))?;
+                post_events.push(event);
+            }
             match op {
                 Operation::Install(package) => {
                     let path = install_path(&vendor_dir, package).unwrap();
@@ -1334,7 +1385,21 @@ impl FilesystemRun<'_> {
                 Operation::MarkAliasUninstalled(package) => local_repo.remove_package(package),
             }
             self.write_local_repo(local_repo, &vendor_dir)?;
+            if let Some(plugin) = plugin {
+                // ponytail: plugins are installed, never activated; the warning stands in for
+                // `PluginManager::registerPackage`
+                if plugin.kind == "composer-plugin"
+                    && !crate::scripts::NO_PLUGINS.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.io.warning(&format!(
+                        "{} is a Composer plugin: romposer installed it but does not execute plugins",
+                        plugin.pretty_name
+                    ));
+                }
+                self.fire_post_events(&mut post_events)?;
+            }
         }
+        self.fire_post_events(&mut post_events)?;
         // do a last write so that we write the repository even if nothing changed
         self.write_local_repo(local_repo, &vendor_dir)?;
         if let Some(run) = &store_run {

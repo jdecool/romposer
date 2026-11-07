@@ -107,10 +107,7 @@ pub struct Args {
 pub fn run(args: &Args, io: &mut Io) -> i32 {
     match execute(args, io) {
         Ok(code) => code,
-        Err(message) => {
-            io.error(&message);
-            1
-        }
+        Err(message) => crate::scripts::exit_code(io, &message),
     }
 }
 
@@ -467,7 +464,15 @@ fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
         options.update_allow_list = Some(names.iter().map(|n| n.to_lowercase()).collect());
     }
     let (status, resolved_lock) =
-        run_installer(io, &file, &contents, &root, &config, lock, options)?;
+        match run_installer(io, &file, &contents, &root, &config, lock, options) {
+            Ok(result) => result,
+            Err(e) => {
+                if !installer::RESOLUTION_COMPLETED.load(std::sync::atomic::Ordering::Relaxed) {
+                    backup.revert(io);
+                }
+                return Err(e);
+            }
+        };
     if status != 0 && status != installer::ERROR_AUDIT_FAILED {
         if status == installer::ERROR_DEPENDENCY_RESOLUTION_FAILED {
             for (name, version) in parse_name_version_pairs(&args.packages) {

@@ -40,6 +40,8 @@ pub struct DumpOptions {
     /// `None` infers from installed.json's `dev` flag
     pub dev_mode: Option<bool>,
     pub dry_run: bool,
+    /// `setRunScripts`: fire `pre/post-autoload-dump`
+    pub run_scripts: bool,
     pub strict_ambiguous: bool,
     pub ignore_all_platform_reqs: bool,
     pub ignored_platform_reqs: Vec<String>,
@@ -59,6 +61,13 @@ pub fn dump(
     let dev_mode = options
         .dev_mode
         .unwrap_or_else(|| local_repo.dev_mode.unwrap_or(false));
+    if options.run_scripts {
+        // set COMPOSER_DEV_MODE in case not set yet so it is available in the dump-autoload event listeners
+        if crate::scripts::get_env("COMPOSER_DEV_MODE").is_none() {
+            crate::scripts::put_env("COMPOSER_DEV_MODE", Some(if dev_mode { "1" } else { "0" }))?;
+        }
+        crate::scripts::fire(io, config, root, "pre-autoload-dump")?;
+    }
 
     let vendor_dir = config.vendor_dir();
     ensure_dir(Path::new(&vendor_dir))?;
@@ -370,6 +379,9 @@ pub fn dump(
     )?;
     write_if_modified(&format!("{target_dir}/ClassLoader.php"), CLASS_LOADER)?;
     write_if_modified(&format!("{target_dir}/LICENSE"), LICENSE)?;
+    if options.run_scripts {
+        crate::scripts::fire(io, config, root, "post-autoload-dump")?;
+    }
 
     Ok(class_map)
 }

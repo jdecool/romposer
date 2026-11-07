@@ -521,6 +521,13 @@ impl Config {
                 Some(Value::String(s)) => s.parse().unwrap_or(0),
                 _ => self.int("cache-ttl"),
             },
+            "process-timeout" => match Self::composer_env(key) {
+                Some(v) => v.trim().parse::<i64>().unwrap_or(0).max(0),
+                None => match self.config.get(key) {
+                    Some(Value::Number(n)) => n.as_i64().unwrap_or(0).max(0),
+                    _ => 0,
+                },
+            },
             _ => match self.config.get(key) {
                 Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
                 Some(Value::String(s)) => s.trim().parse().unwrap_or(0),

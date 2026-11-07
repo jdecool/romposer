@@ -211,7 +211,7 @@ impl BinaryInstaller {
         Ok(())
     }
 
-    fn determine_binary_caller(bin: &str) -> String {
+    pub fn determine_binary_caller(bin: &str) -> String {
         if bin.ends_with(".bat") || bin.ends_with(".exe") {
             return "call".into();
         }

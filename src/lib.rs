@@ -18,6 +18,7 @@ pub mod package;
 pub mod platform;
 pub mod repository;
 pub mod schema;
+pub mod scripts;
 pub mod semver;
 pub mod solver;
 pub mod spdx;

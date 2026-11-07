@@ -78,10 +78,7 @@ pub struct Args {
 pub fn run(args: &Args, io: &mut Io) -> i32 {
     match execute(args, io) {
         Ok(code) => code,
-        Err(message) => {
-            io.error(&message);
-            1
-        }
+        Err(message) => crate::scripts::exit_code(io, &message),
     }
 }
 
