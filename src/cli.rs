@@ -52,6 +52,11 @@ enum Command {
     /// Check that platform requirements are satisfied.
     #[command(name = "check-platform-reqs")]
     CheckPlatformReqs(commands::check_platform_reqs::Args),
+    /// Searches for packages.
+    Search(commands::search::Args),
+    /// Shows information about packages.
+    #[command(visible_alias = "info")]
+    Show(commands::show::Args),
     /// Inspect and maintain the shared package store
     #[command(subcommand)]
     Store(commands::store::Command),
@@ -76,6 +81,8 @@ pub fn run() -> i32 {
         Some(Command::Install(args)) => commands::install::run(&args, &mut io),
         Some(Command::DumpAutoload(args)) => commands::dump_autoload::run(&args, &mut io),
         Some(Command::Store(command)) => commands::store::run(&command, &mut io),
+        Some(Command::Search(args)) => commands::search::run(&args, &mut io),
+        Some(Command::Show(args)) => commands::show::run(&args, &mut io),
         Some(Command::CheckPlatformReqs(args)) => {
             commands::check_platform_reqs::run(&args, &mut io)
         }

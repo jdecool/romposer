@@ -54,6 +54,23 @@ impl Io {
         }
     }
 
+    /// Symfony `Terminal::getWidth`: `COLUMNS`, else the controlling terminal, else 80.
+    pub fn terminal_width() -> usize {
+        if let Ok(cols) = std::env::var("COLUMNS")
+            && let Ok(n) = cols.trim().parse::<usize>()
+        {
+            return n;
+        }
+        for fd in [1, 0, 2] {
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ writes a winsize into the buffer we pass.
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0 {
+                return size.ws_col as usize;
+            }
+        }
+        80
+    }
+
     /// Everything written so far, one entry per line, when buffered.
     pub fn output(&self) -> String {
         self.buffer

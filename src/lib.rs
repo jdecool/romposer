@@ -16,12 +16,14 @@ pub mod json;
 pub mod lock;
 pub mod package;
 pub mod platform;
+pub mod repository;
 pub mod schema;
 pub mod semver;
 pub mod spdx;
 pub mod store;
 pub mod transaction;
 pub mod validation;
+pub mod zend_sort;
 
 /// Composer version whose observable behaviour romposer reproduces.
 pub const COMPOSER_VERSION: &str = "2.11.1";

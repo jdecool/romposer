@@ -10,7 +10,7 @@ use crate::package::Package;
 use regex::Regex;
 use sha1::Digest;
 
-fn sha1_hex(bytes: &[u8]) -> String {
+pub fn sha1_hex(bytes: &[u8]) -> String {
     sha1::Sha1::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -390,15 +390,7 @@ impl Downloader {
         } else {
             None
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(format!(
-                "Composer/{} (romposer; {})",
-                crate::COMPOSER_VERSION,
-                std::env::consts::OS
-            ))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = client()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -844,6 +836,37 @@ async fn fetch_once(
     url: &str,
     file_name: &Path,
 ) -> Result<(), (Option<u16>, String)> {
+    let response = http_get(client, config, url, &[]).await?;
+    std::fs::write(file_name, &response.body).map_err(|e| (None, format!("{} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", sanitize_url(url), file_name.display())))
+}
+
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub last_modified: Option<String>,
+}
+
+/// `reqwest::Client` with Composer's user agent and manual redirects.
+pub fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!(
+            "Composer/{} (romposer; {})",
+            crate::COMPOSER_VERSION,
+            std::env::consts::OS
+        ))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// `HttpDownloader::get` for one URL: redirects followed by hand (20 hops max, auth per
+/// origin), 304 returned as a response, any other non-2xx as `(status, message)`.
+pub async fn http_get(
+    client: &reqwest::Client,
+    config: &Config,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<HttpResponse, (Option<u16>, String)> {
     let mut url = url.to_string();
     for _ in 0..=20 {
         if url.starts_with("http://") && config.bool("secure-http") {
@@ -861,6 +884,9 @@ async fn fetch_once(
             for (k, v) in auth_headers(config, &origin, &url, &auth) {
                 request = request.header(k, v);
             }
+        }
+        for (k, v) in headers {
+            request = request.header(k, v);
         }
         let response = request.send().await.map_err(|e| {
             (
@@ -884,7 +910,7 @@ async fn fetch_once(
             url = next.to_string();
             continue;
         }
-        if !status.is_success() {
+        if !status.is_success() && status.as_u16() != 304 {
             let version = match response.version() {
                 reqwest::Version::HTTP_2 => "HTTP/2".to_string(),
                 reqwest::Version::HTTP_11 => "HTTP/1.1".to_string(),
@@ -899,6 +925,11 @@ async fn fetch_once(
                 ),
             ));
         }
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let bytes = response.bytes().await.map_err(|e| {
             (
                 None,
@@ -909,8 +940,11 @@ async fn fetch_once(
                 ),
             )
         })?;
-        std::fs::write(file_name, &bytes).map_err(|e| (None, format!("{} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", sanitize_url(&url), file_name.display())))?;
-        return Ok(());
+        return Ok(HttpResponse {
+            status: status.as_u16(),
+            body: bytes.to_vec(),
+            last_modified,
+        });
     }
     Err((
         None,
@@ -919,6 +953,57 @@ async fn fetch_once(
             sanitize_url(&url)
         ),
     ))
+}
+
+/// Blocking HTTP for metadata: one client and runtime shared by every repository.
+pub struct Http {
+    client: reqwest::Client,
+    runtime: tokio::runtime::Runtime,
+    config: Config,
+}
+
+impl Http {
+    pub fn new(config: &Config) -> Result<Http, String> {
+        Ok(Http {
+            client: client()?,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?,
+            config: config.clone(),
+        })
+    }
+
+    pub fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, (Option<u16>, String)> {
+        self.runtime
+            .block_on(http_get(&self.client, &self.config, url, headers))
+    }
+
+    /// Every request in parallel, results in request order.
+    pub fn get_all(
+        &self,
+        requests: Vec<(String, Vec<(String, String)>)>,
+    ) -> Vec<Result<HttpResponse, (Option<u16>, String)>> {
+        self.runtime.block_on(async {
+            let handles: Vec<_> = requests
+                .into_iter()
+                .map(|(url, headers)| {
+                    let client = self.client.clone();
+                    let config = self.config.clone();
+                    tokio::spawn(async move { http_get(&client, &config, &url, &headers).await })
+                })
+                .collect();
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.unwrap_or_else(|e| Err((None, e.to_string()))));
+            }
+            out
+        })
+    }
 }
 
 #[cfg(test)]

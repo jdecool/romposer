@@ -224,7 +224,10 @@ impl Config {
     pub fn create(cwd: &str) -> Result<Config, String> {
         let mut config = Config {
             config: defaults(),
-            repositories: vec![],
+            repositories: vec![(
+                "packagist.org".to_string(),
+                serde_json::json!({"type": "composer", "url": "https://repo.packagist.org"}),
+            )],
             base_dir: Some(cwd.to_string()),
         };
         let home = home_dir()?;

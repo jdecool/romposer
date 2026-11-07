@@ -123,6 +123,26 @@ pub fn load_project(
     Ok((file, contents, root, config, lock))
 }
 
+/// `tryComposer`: `None` when there is no composer.json, any other failure is an error.
+#[allow(clippy::type_complexity)]
+pub fn try_load_project(
+    io: &mut Io,
+) -> Result<
+    Option<(
+        std::path::PathBuf,
+        String,
+        crate::package::root::RootPackage,
+        Config,
+        Option<Lock>,
+    )>,
+    String,
+> {
+    if !config::composer_file()?.exists() {
+        return Ok(None);
+    }
+    load_project(io).map(Some)
+}
+
 fn execute(args: &Args, io: &mut Io) -> Result<i32, String> {
     let (_file, _contents, root, config, lock) = load_project(io)?;
     let vendor_dir = config.vendor_dir();
