@@ -12,13 +12,14 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 
 | Metric | Value |
 |---|---|
-| Composer installer fixtures passing | 194/228 (the rest need dependency policies, path repositories or a composer repository served from a directory) |
+| Composer installer fixtures passing | 197/228 (the rest need dependency policies or a composer repository served from a directory) |
 | `update` lock vs composer | byte-identical on a live monolog + symfony/console + phpunit project (full, `--no-dev`, `--prefer-lowest`, `--lock`, partial) |
 | `show` / `search` golden cases vs composer | 31 on a recorded Packagist + live `show symfony/console -a --format=json` |
 | `audit` vs composer | 30 invocations identical (every format, `--locked`, installed, ignore rules, `install --audit`) on a live project pinning a vulnerable guzzle |
 | scripts and events vs composer | every event in the same order, 52 invocations identical (installer events, `run-script`, `exec`, script aliases, failing listeners) |
 | project commands vs composer | 83 `config` invocations (get, set, unset, `--list`, `--global`, `--json`, `--merge`, `--append`, auth keys), 17 `init`/`global`, 4 `clear-cache`, 6 `archive` entry listings, and 9 `create-project` runs identical; `create-project symfony/skeleton --no-plugins` gives the same lock and file listing |
 | git repositories vs composer | identical lock, `installed.json`, `installed.php` and vendor checkout (HEAD, branches, remotes) for tags, branches, branch aliases, `only-branches`, the bare mirror cache and in-place source updates on a generated repository; a public GitHub package locks identically through the API driver and `no-api` |
+| path, artifact and archive dists vs composer | identical lock, `installed.json`, `installed.php`, autoload, vendor/ listing (symlink targets included), stderr and `status -v` on a generated monorepo: globbed and mirrored `path` packages (one versioned from its git feature branch), an `artifact` directory with a tar.gz library and a zip metapackage, xz and phar dists; none reach the store |
 | `install` on Symfony demo, cold / warm, vs Composer with and without pcomposer | _not measured yet_ |
 
 ## Install
@@ -37,6 +38,7 @@ macOS and Linux only.
 - No `self-update`; `diagnose` keeps only the checks that apply to romposer and adds the store.
 - `config --editor` and `config --source` are not supported.
 - `archive` archives the current project only, with the same entries as Composer but not the same bytes.
+- `rar` dists need `unrar`, `phar` dists `php`, `tar`/`xz` dists the system `tar`.
 - No Windows.
 - Human-readable console output is close to Composer's but not byte-identical; machine outputs are.
 

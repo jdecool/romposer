@@ -16,6 +16,8 @@ pub struct ManifestEntry {
 pub struct Manifest {
     pub path: PathBuf,
     recorded: BTreeMap<String, ManifestEntry>,
+    /// installed through the plain path this run: never listed
+    dropped: std::collections::BTreeSet<String>,
 }
 
 impl Manifest {
@@ -23,7 +25,14 @@ impl Manifest {
         Manifest {
             path: PathBuf::from(format!("{vendor_dir}/composer/pcomposer.json")),
             recorded: BTreeMap::new(),
+            dropped: Default::default(),
         }
+    }
+
+    /// A package (re)installed outside the store: its entry goes, unless recorded again.
+    pub fn forget(&mut self, name: &str) {
+        self.recorded.remove(name);
+        self.dropped.insert(name.to_string());
     }
 
     /// Remembers a package materialised during this run, with its effective strategy.
@@ -80,6 +89,7 @@ impl Manifest {
             .map(|p| (p.name.as_str(), p.pretty_version.as_str()))
             .collect();
         let mut entries = self.read();
+        entries.retain(|name, _| !self.dropped.contains(name));
         for (name, entry) in &self.recorded {
             entries.insert(name.clone(), entry.clone());
         }

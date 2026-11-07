@@ -4,11 +4,8 @@ install-policy-custom-list-block-scope-install.test
 install-policy-malware-block-direct-dependency.test
 install-policy-malware-block-scope-install.test
 install-policy-malware-block-transitive-dependency.test
-partial-update-always-updates-symlinked-path-repos.test
-partial-update-loads-root-aliases-for-path-repos.test
 partial-update-policy-malware-block-locked-package.test
 partial-update-security-advisory-matching-locked-dep-with-dependencies.test
-partial-update-with-symlinked-path-repos.test
 update-abandoned-package-required-but-blocked-via-audit-config.test
 update-filter-entry-not-matching-only-exclude.test
 update-mirrors-policy-malware-block-locked-package.test

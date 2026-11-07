@@ -294,17 +294,29 @@ fn run_inner(fixture: &Fixture) -> Outcome {
         _ => vec![],
     };
     {
+        // InstallerTest runs from tests/Composer/Test: path repositories resolve from there
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("reference/composer/tests/Composer/Test");
         for repo in repo_list {
-            if repo.get("type").and_then(Value::as_str) != Some("package") {
-                return fail(format!(
-                    "repository type {:?} is not supported in the fixture runner",
-                    repo.get("type")
-                ));
-            }
-            let defs: Vec<&Value> = match repo.get("package") {
-                Some(Value::Array(list)) => list.iter().collect(),
-                Some(single @ Value::Object(_)) => vec![single],
-                _ => vec![],
+            let scanned: Vec<Value>;
+            let defs: Vec<&Value> = match repo.get("type").and_then(Value::as_str) {
+                Some("package") => match repo.get("package") {
+                    Some(Value::Array(list)) => list.iter().collect(),
+                    Some(single @ Value::Object(_)) => vec![single],
+                    _ => vec![],
+                },
+                Some("path") => {
+                    match crate::path_repo::scan_path(repo.as_object().unwrap(), &base) {
+                        Ok(list) => scanned = list.into_iter().map(Value::Object).collect(),
+                        Err(e) => return exception_outcome(fixture, &e),
+                    }
+                    scanned.iter().collect()
+                }
+                other => {
+                    return fail(format!(
+                        "repository type {other:?} is not supported in the fixture runner"
+                    ));
+                }
             };
             let mut packages = Vec::new();
             for def in defs {

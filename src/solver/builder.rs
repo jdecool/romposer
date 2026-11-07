@@ -64,6 +64,7 @@ impl Repository<'_> {
                 if repo.packages.len() > 1 { "s" } else { "" }
             ),
             Repository::Composer(repo) => match &repo.vcs {
+                Some(vcs) if let Some(name) = vcs.local_name(&repo.url) => name,
                 Some(vcs) => format!(
                     "vcs repo ({} {})",
                     vcs.driver.unwrap_or("vcs"),

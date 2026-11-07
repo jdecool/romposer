@@ -286,11 +286,41 @@ pub struct ComposerRepository {
     pub vcs: Option<Vcs>,
 }
 
-/// A `VcsRepository`: its configuration, and the driver once the scan picked it.
+/// A `VcsRepository`: its configuration, and the driver once the scan picked it. Path,
+/// artifact and package repositories (local `ArrayRepository`s) ride along, told apart by type.
 pub struct Vcs {
     repo: Map<String, Value>,
     config: Config,
     pub driver: Option<&'static str>,
+}
+
+impl Vcs {
+    /// `path`, `artifact`, `package`, or a vcs type
+    pub fn kind(&self) -> &str {
+        self.repo.get("type").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// `getRepoName` of the local ones, `None` for vcs repositories
+    pub fn local_name(&self, url: &str) -> Option<String> {
+        match self.kind() {
+            "path" => Some(format!(
+                "path repo ({})",
+                sanitize_url(self.repo.get("url").and_then(Value::as_str).unwrap_or(""))
+            )),
+            "artifact" => Some(format!("artifact repo ({url})")),
+            "package" => {
+                let count = match self.repo.get("package") {
+                    Some(Value::Array(list)) => list.len(),
+                    _ => 1,
+                };
+                Some(format!(
+                    "package repo (defining {count} package{})",
+                    if count > 1 { "s" } else { "" }
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
 static SCHEME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w.]+\??://").unwrap());
@@ -309,7 +339,24 @@ pub fn from_config(config: &Config, http: Rc<Http>) -> Result<Vec<ComposerReposi
             kind,
             "vcs" | "git" | "github" | "gitlab" | "bitbucket" | "git-bitbucket"
         );
-        // ponytail: path/artifact repositories arrive with ticket 17
+        // path, artifact and inline package repositories are scanned like vcs ones
+        if matches!(kind, "path" | "artifact" | "package") {
+            let url = repo.get("url").and_then(Value::as_str).unwrap_or("");
+            if kind == "path" && url.is_empty() {
+                return Err(
+                    "You must specify the `url` configuration for the path repository".into(),
+                );
+            }
+            let mut r = ComposerRepository::new(name, "file:///", repo, config, http.clone())?;
+            r.url = crate::config::expand_path(url);
+            r.vcs = Some(Vcs {
+                repo: repo.clone(),
+                config: config.clone(),
+                driver: None,
+            });
+            repos.push(r);
+            continue;
+        }
         if kind != "composer" && !vcs {
             continue;
         }
@@ -612,8 +659,23 @@ impl ComposerRepository {
 
     fn build_root(&mut self, io: &mut Io, max_age: Option<u64>) -> Result<RootData, String> {
         if let Some(vcs) = &mut self.vcs {
-            let scan = crate::vcs::scan(io, &vcs.config, &self.http, &vcs.repo)?;
-            vcs.driver = Some(scan.driver);
+            let base = std::path::Path::new(".");
+            let inline = match vcs.kind() {
+                "path" => crate::path_repo::scan_path(&vcs.repo, base)?,
+                "artifact" => crate::path_repo::scan_artifact(io, &vcs.repo, base)?,
+                "package" => match vcs.repo.get("package") {
+                    Some(Value::Array(list)) => {
+                        list.iter().filter_map(|p| p.as_object().cloned()).collect()
+                    }
+                    Some(Value::Object(one)) => vec![one.clone()],
+                    _ => vec![],
+                },
+                _ => {
+                    let scan = crate::vcs::scan(io, &vcs.config, &self.http, &vcs.repo)?;
+                    vcs.driver = Some(scan.driver);
+                    scan.packages
+                }
+            };
             return Ok(RootData {
                 metadata_url: None,
                 search_url: None,
@@ -622,7 +684,7 @@ impl ComposerRepository {
                 available: None,
                 patterns: vec![],
                 dist_mirrors: vec![],
-                inline: scan.packages,
+                inline,
                 advisories: None,
             });
         }

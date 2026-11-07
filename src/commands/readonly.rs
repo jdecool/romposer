@@ -1,7 +1,4 @@
 //! The small inspection commands: `licenses`, `fund`, `suggests`, `status`, `outdated`.
-//!
-//! ponytail: `status` only knows dist installs, so it always reports no local
-//! changes (VCS checks arrive with ticket 16).
 
 use crate::commands::dump_autoload::load_project;
 use crate::commands::table;
@@ -505,11 +502,249 @@ pub fn status(_args: &StatusArgs, io: &mut Io) -> i32 {
 fn status_inner(io: &mut Io) -> Result<i32, String> {
     let (_, _, root, config, _) = load_project(io)?;
     crate::scripts::fire(io, &config, &root, "pre-status-cmd")?;
-    let repo = local_repo(&config)?;
-    let _ = repo;
-    io.error("No local changes");
+    let code = status_execute(io, &config, &root)?;
     crate::scripts::fire(io, &config, &root, "post-status-cmd")?;
-    Ok(0)
+    Ok(code)
+}
+
+/// `StatusCommand::doExecute`
+// ponytail: unpushed commits (`getUnpushedChanges`) are not reported
+fn status_execute(
+    io: &mut Io,
+    config: &crate::config::Config,
+    root: &crate::package::root::RootPackage,
+) -> Result<i32, String> {
+    let repo = local_repo(config)?;
+    let vendor_dir = crate::fs::realpath(Path::new(&config.vendor_dir()));
+    let store =
+        crate::store::StoreConfig::from_root(&root.package.extra, &config.get_str("cache-dir"))?;
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut variations: Vec<(String, [(String, String); 2])> = Vec::new();
+    for package in repo.canonical_packages() {
+        let Some(target) = crate::installer::install_path(&vendor_dir, package) else {
+            continue;
+        };
+        let source = package.installation_source.as_deref() == Some("source");
+        let git = source && package.source.as_ref().is_some_and(|s| s.kind == "git");
+        let path = !source && package.dist.as_ref().is_some_and(|d| d.kind == "path");
+        let set = |errors: &mut Vec<(String, String)>, text: String| match errors
+            .iter_mut()
+            .find(|(t, _)| *t == target)
+        {
+            Some(entry) => entry.1 = text,
+            None => errors.push((target.clone(), text)),
+        };
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_symlink()) {
+            set(&mut errors, format!("{target} is a symbolic link."));
+        }
+        let changes = if git {
+            let dir = Path::new(&target);
+            if dir.join(".git").is_dir() {
+                let out = crate::git::git(
+                    &["status", "--porcelain", "--untracked-files=no"],
+                    Some(dir),
+                );
+                if !out.ok {
+                    return Err(format!(
+                        "Failed to execute git status --porcelain --untracked-files=no\n\n{}",
+                        out.stderr
+                    ));
+                }
+                Some(out.stdout.trim().to_string()).filter(|o| !o.is_empty())
+            } else {
+                None
+            }
+        } else if !source {
+            compare_changes(config, store.enabled, package, &target)
+        } else {
+            None
+        };
+        if let Some(changes) = changes {
+            set(&mut errors, changes);
+        }
+        // `VcsCapableDownloaderInterface`: git checkouts and path packages
+        if git || path {
+            let dump = crate::package::dumper::dump(package);
+            if let Some(current) = crate::path_repo::guess_version(&dump, Path::new(&target))
+                && let Some(commit) = current.commit
+            {
+                let previous = if source {
+                    package.source.as_ref().and_then(|s| s.reference.clone())
+                } else {
+                    package.dist.as_ref().and_then(|d| d.reference.clone())
+                };
+                if let Some(previous) = previous.filter(|p| !p.is_empty())
+                    && commit != previous
+                    && current.pretty_version != previous
+                {
+                    variations.push((
+                        target.clone(),
+                        [
+                            (package.pretty_version.clone(), previous),
+                            (current.pretty_version, commit),
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+    if errors.is_empty() && variations.is_empty() {
+        io.error("No local changes");
+        return Ok(0);
+    }
+    let verbose = io.verbosity >= 1;
+    if !errors.is_empty() {
+        io.error("You have changes in the following dependencies:");
+        for (path, changes) in &errors {
+            if verbose {
+                io.write(&format!("{path}:"));
+                for line in changes.split('\n') {
+                    // Comparer's `\r` line ends survive PHP's ltrim; the text itself is cleaned
+                    let line = line.trim_start();
+                    let cr = if line.ends_with('\r') { "\r" } else { "" };
+                    io.write_raw(&format!("    {}{cr}", Io::clean(line)));
+                }
+            } else {
+                io.write(path);
+            }
+        }
+    }
+    if !variations.is_empty() {
+        io.error("You have version variations in the following dependencies:");
+        for (path, [(prev_version, prev_ref), (cur_version, cur_ref)]) in &variations {
+            if verbose {
+                let mut current = if cur_version.is_empty() {
+                    cur_ref.clone()
+                } else {
+                    cur_version.clone()
+                };
+                let mut previous = if prev_version.is_empty() {
+                    prev_ref.clone()
+                } else {
+                    prev_version.clone()
+                };
+                if io.verbosity >= 2 {
+                    current.push_str(&format!(" ({cur_ref})"));
+                    previous.push_str(&format!(" ({prev_ref})"));
+                }
+                io.write(&format!("{path}:"));
+                io.write(&format!("    From {previous} to {current}"));
+            } else {
+                io.write(path);
+            }
+        }
+    }
+    if !verbose {
+        io.error("Use --verbose (-v) to see a list of files");
+    }
+    Ok(if errors.is_empty() { 0 } else { 1 } + if variations.is_empty() { 0 } else { 4 })
+}
+
+/// `FileDownloader::getLocalChanges`: a fresh plain install (never the store) next to the
+/// package in `<path>_compare`, compared file by file.
+fn compare_changes(
+    config: &crate::config::Config,
+    store_enabled: bool,
+    package: &Package,
+    target: &str,
+) -> Option<String> {
+    let compare = format!("{target}_compare");
+    let compare = Path::new(&compare);
+    let mut quiet = Io::buffered();
+    let result = (|| -> Result<String, String> {
+        crate::fs::remove(compare)?;
+        if package.dist.as_ref().is_some_and(|d| d.kind == "path") {
+            crate::path_repo::check_source(package, compare)?;
+            crate::path_repo::install(&mut quiet, package, compare, None)?;
+        } else {
+            let mut downloader = crate::download::Downloader::new(config)?;
+            downloader.set_write_cache(!store_enabled);
+            let mut archives = downloader.download_all(&mut quiet, &[package])?;
+            let archive = archives
+                .remove(&package.unique_name())
+                .ok_or("missing download")?
+                .archive;
+            downloader.install_archive(package, &archive, compare)?;
+        }
+        let changes = compare_trees(compare, Path::new(target));
+        crate::fs::remove(compare)?;
+        Ok(changes)
+    })();
+    match result {
+        Ok(changes) => Some(changes.trim().to_string()).filter(|c| !c.is_empty()),
+        Err(e) => Some(format!("Failed to detect changes: [RuntimeException] {e}")),
+    }
+}
+
+type Tree = Vec<(String, Vec<(String, String)>)>;
+
+/// `Comparer::doTree`: per directory (`.`, `./sub`), each file's hash or link target, in
+/// readdir order; empty files and directories are not listed.
+fn tree(root: &Path, dir: &str, out: &mut Tree) {
+    let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let value = if let Ok(link) = std::fs::read_link(&path) {
+            link.to_string_lossy().into_owned()
+        } else if path.is_dir() {
+            tree(root, &format!("{dir}/{name}"), out);
+            continue;
+        } else if path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
+            crate::download::sha1_hex(&std::fs::read(&path).unwrap_or_default())
+        } else {
+            continue;
+        };
+        match out.iter_mut().find(|(d, _)| d == dir) {
+            Some((_, files)) => files.push((name, value)),
+            None => out.push((dir.to_string(), vec![(name, value)])),
+        }
+    }
+}
+
+/// `Comparer::doCompare` + `getChangedAsString(true)`
+fn compare_trees(source: &Path, update: &Path) -> String {
+    let (mut from, mut to) = (Vec::new(), Vec::new());
+    tree(source, ".", &mut from);
+    tree(update, ".", &mut to);
+    let lookup = |t: &Tree, dir: &str, file: &str| -> Option<String> {
+        t.iter()
+            .find(|(d, _)| d == dir)
+            .and_then(|(_, f)| f.iter().find(|(n, _)| n == file))
+            .map(|(_, h)| h.clone())
+    };
+    let mut sections: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut add = |section: &'static str, item: String| match sections
+        .iter_mut()
+        .find(|(s, _)| *s == section)
+    {
+        Some((_, items)) => items.push(item),
+        None => sections.push((section, vec![item])),
+    };
+    for (dir, files) in &from {
+        for (file, hash) in files {
+            match lookup(&to, dir, file) {
+                Some(other) if other != *hash => add("changed", format!("{dir}/{file}")),
+                Some(_) => {}
+                None => add("removed", format!("{dir}/{file}")),
+            }
+        }
+    }
+    for (dir, files) in &to {
+        for (file, _) in files {
+            if lookup(&from, dir, file).is_none() {
+                add("added", format!("{dir}/{file}"));
+            }
+        }
+    }
+    sections
+        .into_iter()
+        .flat_map(|(_, items)| items)
+        .map(|i| format!("{i}\r\n"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 // ---------------------------------------------------------------- outdated

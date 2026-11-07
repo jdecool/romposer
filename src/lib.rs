@@ -16,6 +16,7 @@ pub mod io;
 pub mod json;
 pub mod lock;
 pub mod package;
+pub mod path_repo;
 pub mod platform;
 pub mod repository;
 pub mod schema;

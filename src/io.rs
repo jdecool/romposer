@@ -37,6 +37,15 @@ impl Io {
         }
     }
 
+    /// `write` of a line the caller already cleaned, kept byte for byte (Comparer's `\r`).
+    pub fn write_raw(&mut self, line: &str) {
+        if let Some(buffer) = &mut self.buffer {
+            buffer.push(line.to_string());
+        } else if !self.quiet {
+            let _ = writeln!(std::io::stdout(), "{line}");
+        }
+    }
+
     pub fn error(&mut self, line: &str) {
         let line = Self::clean(line);
         if let Some(buffer) = &mut self.buffer {

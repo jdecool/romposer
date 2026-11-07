@@ -465,7 +465,7 @@ pub struct Autoloads {
 }
 
 /// `strnatcasecmp`
-fn natcasecmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn natcasecmp(a: &str, b: &str) -> std::cmp::Ordering {
     let a = a.to_lowercase();
     let b = b.to_lowercase();
     let (ab, bb) = (a.as_bytes(), b.as_bytes());

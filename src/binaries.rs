@@ -120,7 +120,12 @@ impl BinaryInstaller {
                 io.error(&format!("    Skipped installation of bin {bin} for package {}: the bin resolves to a path outside of the package directory", package.name));
                 continue;
             }
-            let bin_path = real_bin.unwrap().to_string_lossy().into_owned();
+            // an absolute path stays as written (through a path repository's symlink)
+            let bin_path = if bin_path.is_absolute() {
+                bin_path.to_string_lossy().into_owned()
+            } else {
+                real_bin.unwrap().to_string_lossy().into_owned()
+            };
             ensure_dir(Path::new(&self.bin_dir))?;
             self.bin_dir = realpath(Path::new(&self.bin_dir));
             let link = format!("{}/{}", self.bin_dir, php_basename(bin));

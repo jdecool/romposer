@@ -145,7 +145,11 @@ const VCS: [&str; 9] = [
 ];
 
 /// `ArchivableFilesFinder`: kept files and empty directories, relative, sorted by name.
-fn archivable(sources: &Path, excludes: &[String], ignore_filters: bool) -> Vec<(String, bool)> {
+pub(crate) fn archivable(
+    sources: &Path,
+    excludes: &[String],
+    ignore_filters: bool,
+) -> Vec<(String, bool)> {
     let filters: Vec<Vec<(Regex, bool)>> = if ignore_filters {
         vec![]
     } else {

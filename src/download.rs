@@ -1,6 +1,6 @@
-//! Port of `FileDownloader` + `ZipDownloader` + `ArchiveDownloader` for zip
-//! dists: parallel HTTP downloads with Composer's auth rules, the files cache
-//! at Composer's path, checksum verification, extraction and single-root
+//! Port of `FileDownloader` + `ArchiveDownloader` and the zip, tar, xz, phar and rar
+//! extractors: parallel HTTP downloads (local paths copied) with Composer's auth rules,
+//! the files cache at Composer's path, checksum verification, extraction and single-root
 //! unwrapping.
 
 use crate::config::{Auth, Config};
@@ -407,7 +407,7 @@ impl Downloader {
         })
     }
 
-    /// When false the zip cache is read but never written (the store holds the files instead).
+    /// When false the cache is read but never written for zip dists (the store holds them).
     pub fn set_write_cache(&mut self, write: bool) {
         self.write_cache = write;
     }
@@ -497,22 +497,21 @@ impl Downloader {
                 package.name,
                 package.full_pretty_version()
             ));
-            jobs.push(((*package).clone(), file_name, urls, checksum));
+            // the store only takes zip dists: other archives keep Composer's files cache
+            let cache = self.write_cache || dist.kind != "zip";
+            jobs.push(((*package).clone(), file_name, urls, checksum, cache));
         }
 
         if !jobs.is_empty() {
             let client = self.client.clone();
             let config = self.config.clone();
-            let cache_dir = self
-                .cache_dir
-                .clone()
-                .filter(|_| !self.cache_read_only && self.write_cache);
+            let cache_dir = self.cache_dir.clone().filter(|_| !self.cache_read_only);
             let outcomes = self.runtime.block_on(async move {
                 let mut handles = Vec::new();
-                for (package, file_name, urls, checksum) in jobs {
+                for (package, file_name, urls, checksum, cache) in jobs {
                     let client = client.clone();
                     let config = config.clone();
-                    let cache_dir = cache_dir.clone();
+                    let cache_dir = cache_dir.clone().filter(|_| cache);
                     handles.push(tokio::spawn(async move {
                         let res = fetch_with_retries(
                             &client,
@@ -577,7 +576,7 @@ impl Downloader {
             }
         }
         ensure_dir(&temporary_dir)?;
-        let result = extract_zip(archive, &temporary_dir).and_then(|()| {
+        let result = extract(package, archive, &temporary_dir).and_then(|()| {
             let _ = remove(archive);
             // if the target is clear, the whole package is renamed in one go
             let rename_as_one =
@@ -681,6 +680,120 @@ fn rename_recursively(package: &Package, from: &Path, to: &Path) -> Result<(), S
     Ok(())
 }
 
+const PHAR_EXTRACT: &str = "$p = new Phar($argv[1]); $p->extractTo($argv[2], null, true);";
+
+/// `<Type>Downloader::extract`: zip in-process, `tar` and `xz` with the system `tar` (which
+/// refuses absolute and `..` names on its own; the listing is checked first anyway), `phar`
+/// through `php`, `rar` with `unrar`. Paths go as plain arguments, never through a shell, and
+/// once extracted no symlink may resolve outside the target.
+pub fn extract(package: &Package, archive: &Path, target: &Path) -> Result<(), String> {
+    let kind = package.dist.as_ref().map_or("", |d| d.kind.as_str());
+    if kind == "zip" {
+        return extract_zip(archive, target);
+    }
+    let (a, t) = (archive.to_string_lossy(), target.to_string_lossy());
+    let rar_target = format!("{t}/");
+    let (program, args): (&str, Vec<&str>) = match kind {
+        "tar" => ("tar", vec!["-xf", &a, "-C", &t]),
+        "xz" => ("tar", vec!["-xJf", &a, "-C", &t]),
+        "phar" => ("php", vec!["-r", PHAR_EXTRACT, "--", &a, &t]),
+        "rar" => ("unrar", vec!["x", "-idq", "--", &a, &rar_target]),
+        other => {
+            return Err(format!(
+                "Unknown downloader type: {other}. Available types: git, svn, fossil, hg, perforce, zip, rar, tar, gzip, xz, phar, file, path."
+            ));
+        }
+    };
+    if program == "tar" {
+        for name in tar_entries(archive)? {
+            if Path::new(&name).is_absolute()
+                || Path::new(&name)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!(
+                    "Failed to extract {}: invalid entry name {name:?}",
+                    archive.display()
+                ));
+            }
+        }
+    }
+    let out = std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        // ponytail: RarDownloader's php.ini hint is left out of the message
+        _ if kind == "rar" => {
+            return Err("Could not decompress the archive, enable the PHP rar extension.".into());
+        }
+        Ok(o) => {
+            return Err(format!(
+                "Failed to execute {program} {}\n\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&o.stderr)
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "Failed to execute {program} {}\n\n{e}",
+                args.join(" ")
+            ));
+        }
+    }
+    let root = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+    check_tree(archive, &root, &root, kind == "rar")
+}
+
+/// Names in a tar archive, as `tar -t` lists them.
+pub fn tar_entries(archive: &Path) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(archive)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to read {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Every symlink under `dir` resolves inside `root`; `writable` adds `u+w` (unrar's chmod).
+fn check_tree(archive: &Path, root: &Path, dir: &Path, writable: bool) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_symlink() {
+            if !std::fs::canonicalize(&path).is_ok_and(|p| p.starts_with(root)) {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!(
+                    "Failed to extract {}: symlink {} points outside of the package",
+                    archive.display(),
+                    path.display()
+                ));
+            }
+            continue;
+        }
+        if writable {
+            let mode = meta.permissions().mode() | 0o200;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+        if meta.is_dir() {
+            check_tree(archive, root, &path, writable)?;
+        }
+    }
+    Ok(())
+}
+
 /// What `unzip -qq` leaves on disk: entries with their stored unix modes, symlinks restored.
 /// Regular entries are written first and symlinks last, so no entry is ever written
 /// through a link, and a link may only point inside the extraction root.
@@ -770,11 +883,12 @@ async fn fetch_with_retries(
         loop {
             match fetch_once(client, config, processed, file_name).await {
                 Ok(()) => {
-                    // a truncated download lacks the end of central directory record
+                    // a truncated zip lacks the end of central directory record
                     let bytes = std::fs::read(file_name).map_err(|e| e.to_string())?;
                     let tail_start = bytes.len().saturating_sub(22 + 65535);
                     let tail = &bytes[tail_start..];
-                    if !tail.windows(4).any(|w| w == b"PK\x05\x06") {
+                    let zip = package.dist.as_ref().is_some_and(|d| d.kind == "zip");
+                    if zip && !tail.windows(4).any(|w| w == b"PK\x05\x06") {
                         last_err = format!(
                             "The downloaded archive for {} is truncated or corrupt, zip end of central directory not found (file size: {} bytes)",
                             package.name,
@@ -836,6 +950,16 @@ async fn fetch_once(
     url: &str,
     file_name: &Path,
 ) -> Result<(), (Option<u16>, String)> {
+    // local paths and file:// URLs (artifact repositories) are copied, as RemoteFilesystem does
+    if !Regex::new(r"(?i)^https?://").unwrap().is_match(url) {
+        let local = url.strip_prefix("file://").unwrap_or(url);
+        return std::fs::copy(local, file_name).map(|_| ()).map_err(|e| {
+            (
+                Some(404),
+                format!("The \"{url}\" file could not be downloaded ({e})"),
+            )
+        });
+    }
     let response = http_get(client, config, url, &[]).await?;
     std::fs::write(file_name, &response.body).map_err(|e| (None, format!("{} could not be saved to {}, make sure the directory is writable and you have internet connectivity ({e})", sanitize_url(url), file_name.display())))
 }

@@ -1,7 +1,8 @@
 //! Port of `Installer::run` / `doInstall` for an install from an existing lock,
 //! plus the `InstallationManager` execution loop (download everything, then
 //! install in order, binaries, installed.json). Zip dists go through the
-//! pcomposer store by default; the plain Composer path is the fallback.
+//! pcomposer store by default; other archives, path packages, metapackages and
+//! source checkouts take the plain Composer path.
 
 use crate::binaries::BinaryInstaller;
 use crate::config::Config;
@@ -167,10 +168,7 @@ pub fn install_path(vendor_dir: &str, package: &Package) -> Option<String> {
 
 fn unsupported(package: &Package, source: &str) -> Option<String> {
     if package.kind == "metapackage" {
-        return Some(format!(
-            "{}: metapackages are not yet supported (romposer slice 1 installs zip dists only)",
-            package.pretty_name
-        ));
+        return None;
     }
     if source == "source" {
         let kind = package.source.as_ref().map_or("", |s| s.kind.as_str());
@@ -181,13 +179,33 @@ fn unsupported(package: &Package, source: &str) -> Option<String> {
             )
         });
     }
-    match package.dist.as_ref().map_or("", |d| d.kind.as_str()) {
-        "zip" => None,
+    match dist_kind(package) {
+        "zip" | "tar" | "xz" | "phar" | "rar" | "path" => None,
         other => Some(format!(
-            "{}: dist type \"{other}\" is not yet supported (romposer slice 1 installs zip dists only)",
+            "{}: dist type \"{other}\" is not supported by romposer",
             package.pretty_name
         )),
     }
+}
+
+fn dist_kind(package: &Package) -> &str {
+    package.dist.as_ref().map_or("", |d| d.kind.as_str())
+}
+
+/// `PathDownloader::remove` keeps a source that is the install path itself.
+fn is_own_source(package: &Package, path: &str) -> bool {
+    let absolute = |p: &str| {
+        crate::fs::normalize_path(&if crate::fs::is_absolute_path(p) {
+            p.to_string()
+        } else {
+            format!("{}/{p}", crate::fs::cwd())
+        })
+    };
+    dist_kind(package) == "path"
+        && package
+            .dist
+            .as_ref()
+            .is_some_and(|d| absolute(&d.url) == absolute(path))
 }
 
 /// `--prefer-source` / `--prefer-dist` when given, else `preferred-install` (Composer's
@@ -1361,11 +1379,22 @@ impl FilesystemRun<'_> {
                 crate::git::download(self.io, self.config, p)?,
             );
         }
+        // `PathDownloader::download`: only checks, nothing to fetch
+        for p in &to_install {
+            if dist_kind(p) == "path" && !from_source(p) {
+                crate::path_repo::check_source(
+                    p,
+                    Path::new(&install_path(&vendor_dir, p).unwrap_or_default()),
+                )?;
+            }
+        }
         let to_download: Vec<&Package> = to_install
             .iter()
             .copied()
             .filter(|p| {
                 !from_source(p)
+                    && p.kind != "metapackage"
+                    && dist_kind(p) != "path"
                     && (!goes_through_store(&store_run, &vendor_dir, p)
                         || !store_run
                             .as_ref()
@@ -1404,13 +1433,30 @@ impl FilesystemRun<'_> {
                 post_events.push(event);
             }
             match op {
+                Operation::Install(package) if package.kind == "metapackage" => {
+                    // `MetapackageInstaller`: nothing on disk
+                    self.io.error(&format!("  - {}", label(package, None)));
+                    if !local_repo.has_package(package) {
+                        local_repo.add_package(package.clone());
+                    }
+                }
                 Operation::Install(package) => {
                     let path = install_path(&vendor_dir, package).unwrap();
                     if !Path::new(&path).exists() && local_repo.has_package(package) {
                         binaries.remove_binaries(package)?;
                     }
+                    if let Some(run) = &mut store_run {
+                        run.manifest.forget(&package.name);
+                    }
                     let source = from_source(package);
-                    if source {
+                    if !source && dist_kind(package) == "path" {
+                        crate::path_repo::install(
+                            self.io,
+                            package,
+                            Path::new(&path),
+                            Some(&label(package, None)),
+                        )?;
+                    } else if source {
                         crate::git::install(
                             self.io,
                             self.config,
@@ -1439,11 +1485,32 @@ impl FilesystemRun<'_> {
                     }
                     downloader.cleanup(package, Path::new(&path));
                 }
+                Operation::Update { initial, target }
+                    if initial.kind == "metapackage" || target.kind == "metapackage" =>
+                {
+                    // ponytail: a library becoming a metapackage (or back) is updated in place,
+                    // Composer uninstalls and installs as the installer type changes
+                    if let Some(path) = install_path(&vendor_dir, initial) {
+                        binaries.remove_binaries(initial)?;
+                        remove(Path::new(&path))?;
+                    }
+                    self.io
+                        .error(&format!("  - {}", label(target, Some(initial))));
+                    local_repo.remove_package(initial);
+                    if !local_repo.has_package(target) {
+                        local_repo.add_package(target.clone());
+                    }
+                }
                 Operation::Update { initial, target } => {
                     let initial_path = install_path(&vendor_dir, initial).unwrap();
                     let target_path = install_path(&vendor_dir, target).unwrap();
                     let source = from_source(target);
                     let was_source = initial.installation_source.as_deref() == Some("source");
+                    if let Some(run) = &mut store_run {
+                        run.manifest.forget(&target.name);
+                    }
+                    let from_path = !was_source && dist_kind(initial) == "path";
+                    let to_path = !source && dist_kind(target) == "path";
                     // a source checkout is only replaced once its local changes are dealt with
                     let forced = if was_source {
                         crate::git::clean_changes(self.config, Path::new(&initial_path), source)?
@@ -1468,6 +1535,53 @@ impl FilesystemRun<'_> {
                             Path::new(&target_path),
                             forced,
                         )?;
+                    } else if to_path && from_path {
+                        // `FileDownloader::update`: one line, then remove and install silently
+                        self.io.error(&format!(
+                            "  - {target_label}{}",
+                            crate::path_repo::appendix(target, Path::new(&target_path))
+                        ));
+                        if !is_own_source(initial, &initial_path) {
+                            remove(Path::new(&initial_path))?;
+                        }
+                        crate::path_repo::install(self.io, target, Path::new(&target_path), None)?;
+                    } else if to_path || from_path {
+                        // the downloader type changed: removal and a fresh install
+                        self.io.error(&format!(
+                            "  - Removing {} ({})",
+                            initial.pretty_name,
+                            initial.full_pretty_version()
+                        ));
+                        if !is_own_source(initial, &initial_path) {
+                            remove(Path::new(&initial_path))?;
+                        }
+                        if to_path {
+                            crate::path_repo::install(
+                                self.io,
+                                target,
+                                Path::new(&target_path),
+                                Some(&label(target, None)),
+                            )?;
+                        } else if source {
+                            crate::git::install(
+                                self.io,
+                                self.config,
+                                target,
+                                Path::new(&target_path),
+                                &label(target, None),
+                                cached[&target.unique_name()],
+                            )?;
+                        } else {
+                            self.install_code(
+                                &mut store_run,
+                                &mut downloader,
+                                &mut archives,
+                                target,
+                                Path::new(&target_path),
+                                &vendor_dir,
+                                None,
+                            )?;
+                        }
                     } else {
                         remove(Path::new(&initial_path))?;
                         if source {
@@ -1502,12 +1616,18 @@ impl FilesystemRun<'_> {
                     downloader.cleanup(target, Path::new(&target_path));
                 }
                 Operation::Uninstall(package) => {
+                    let path = install_path(&vendor_dir, package);
+                    let own_source = path.as_ref().is_some_and(|p| is_own_source(package, p));
                     self.io.error(&format!(
-                        "  - Removing {} ({})",
+                        "  - Removing {} ({}){}",
                         package.pretty_name,
-                        package.full_pretty_version()
+                        package.full_pretty_version(),
+                        match (&path, own_source) {
+                            (Some(p), true) => format!(", source is still present in {p}"),
+                            _ => String::new(),
+                        }
                     ));
-                    if let Some(path) = install_path(&vendor_dir, package) {
+                    if let Some(path) = path.filter(|_| !own_source) {
                         if package.installation_source.as_deref() == Some("source") {
                             crate::git::clean_changes(self.config, Path::new(&path), false)?;
                         }
