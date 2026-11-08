@@ -16,6 +16,8 @@ jobs:
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.3"
