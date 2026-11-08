@@ -35,6 +35,8 @@ pub fn run_env(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> O
         .env("COMPOSER_HOME", dir.join(".composer-home"))
         .env("COMPOSER_NO_INTERACTION", "1")
         .env_remove("COMPOSER")
+        // composer adds `::error::` annotations to stdout on GitHub Actions; romposer does not
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("PCOMPOSER_DISABLE")
         .env_remove("PCOMPOSER_STRATEGY")
         .env_remove("PCOMPOSER_STORE");

@@ -30,6 +30,8 @@ pub struct BinaryInstaller {
 
 /// The process umask, read once by setting and restoring it: read again while other threads
 /// extract, the set/restore pair could race and lose the real value.
+// mode_t is u16 on macOS but already u32 on Linux
+#[allow(clippy::useless_conversion)]
 pub fn umask() -> u32 {
     static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     // SAFETY: plain libc calls; the value is restored immediately.
