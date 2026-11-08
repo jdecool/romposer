@@ -28,10 +28,10 @@ This is a personal, exploratory project. Its deliverables are the binary and two
 
 | install (median of 3) | composer | composer + pcomposer | romposer, store disabled | romposer, store enabled |
 |---|---|---|---|---|
-| cold | 12.04 s | 47.55 s | 14.62 s | 51.04 s |
-| warm | 4.55 s | 10.23 s | 6.00 s | 9.34 s |
+| cold | 12.56 s | 37.40 s | 10.03 s | 15.75 s |
+| warm | 4.20 s | 8.14 s | 3.61 s | 4.19 s |
 
-Machine: MacBook Pro (MacBookPro18,3), Apple M1 Pro, 16 GB, macOS 27.2, APFS, PHP 8.5.12, Composer 2.11.1, romposer built with `cargo build --release` (rustc 1.99.1), over a home connection. On this machine the store costs time rather than saving it, for pcomposer and romposer alike: cold runs, which fill it, take about 4x longer, and warm runs from it are slower than unzipping from Composer's cache. Its gain here is disk space shared across projects, not speed. Not profiled yet. Installer fixtures: 197/228 (the `Installer fixtures pass rate` step of CI).
+Machine: MacBook Pro (MacBookPro18,3), Apple M1 Pro, 16 GB, macOS 27.2, APFS, PHP 8.5.12, Composer 2.11.1, romposer built with `cargo build --release` (rustc 1.99.1), over a home connection. Numbers are after romposer's install optimisations: store files hashed while the zip inflates, zip entries streamed straight into the store, and packages extracted, ingested and linked on all cores while the output keeps Composer's order. Without the store, romposer is now faster than Composer cold and warm. With it, a cold run, which fills the store, costs about a quarter more than Composer's, and a warm run from it matches Composer; pcomposer's store still costs about 3x cold and 2x warm. The store's main gain stays disk space shared across projects. Installer fixtures: 197/228 (the `Installer fixtures pass rate` step of CI).
 
 ## Install
 

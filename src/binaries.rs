@@ -28,14 +28,16 @@ pub struct BinaryInstaller {
     pub vendor_dir: String,
 }
 
-/// The process umask, read by setting and restoring it.
+/// The process umask, read once by setting and restoring it: read again while other threads
+/// extract, the set/restore pair could race and lose the real value.
 pub fn umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     // SAFETY: plain libc calls; the value is restored immediately.
-    unsafe {
+    *UMASK.get_or_init(|| unsafe {
         let old = libc::umask(0o022);
         libc::umask(old);
         u32::from(old)
-    }
+    })
 }
 
 fn chmod_executable(path: &Path) {

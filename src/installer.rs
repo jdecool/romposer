@@ -6,7 +6,7 @@
 
 use crate::binaries::BinaryInstaller;
 use crate::config::Config;
-use crate::download::{Downloader, extract_zip_hashed, ingest_zip};
+use crate::download::{Downloaded, Downloader, extract_archive, extract_zip_hashed, ingest_zip};
 use crate::fs::{ensure_dir, is_dir_empty, realpath, remove};
 use crate::installed::InstalledRepository;
 use crate::io::Io;
@@ -24,7 +24,7 @@ use crate::solver::policy::DefaultPolicy;
 use crate::solver::problem::Ctx;
 use crate::solver::sat::{Solver, SolverProblems};
 use crate::solver::{self, Pool, Request};
-use crate::store::{Manifest, Store, StoreConfig};
+use crate::store::{Manifest, Store, StoreConfig, Strategy};
 use crate::transaction::{Operation, calculate_operations};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1413,263 +1413,380 @@ impl FilesystemRun<'_> {
             return Ok(());
         }
 
+        // fresh zip installs are extracted or linked on all cores first; the loop below still
+        // prints and finishes each operation in order, taking the result as it gets there
+        let mut prepared: HashMap<String, Prepared> = HashMap::new();
+        let listened = self.options.run_scripts
+            && ["install", "update", "uninstall"].iter().any(|e| {
+                !crate::scripts::listeners(self.root, &format!("pre-package-{e}")).is_empty()
+                    || !crate::scripts::listeners(self.root, &format!("post-package-{e}"))
+                        .is_empty()
+            });
+        if !listened {
+            let paths: Vec<String> = operations
+                .iter()
+                .flat_map(|op| match op {
+                    Operation::Install(p) | Operation::Uninstall(p) => vec![p],
+                    Operation::Update { initial, target } => vec![initial, target],
+                    _ => vec![],
+                })
+                .filter_map(|p| install_path(&vendor_dir, p).map(|path| path.to_lowercase()))
+                .collect();
+            // ponytail: O(n²) scan; a package whose dir another operation touches (same, inside
+            // or around it) stays sequential
+            let alone = |path: &str| {
+                let path = path.to_lowercase();
+                let nested = |a: &str, b: &str| b.starts_with(&format!("{a}/"));
+                paths
+                    .iter()
+                    .filter(|o| **o == path || nested(o, &path) || nested(&path, o))
+                    .count()
+                    == 1
+            };
+            let jobs: Vec<(&Package, String, Option<PathBuf>, bool)> = operations
+                .iter()
+                .filter_map(|op| match op {
+                    Operation::Install(p) => Some(p),
+                    _ => None,
+                })
+                .filter(|p| p.kind != "metapackage" && !from_source(p) && dist_kind(p) == "zip")
+                .filter_map(|p| {
+                    let path = install_path(&vendor_dir, p)?;
+                    (!Path::new(&path).exists() && alone(&path)).then_some((p, path))
+                })
+                .map(|(p, path)| {
+                    let via_store = goes_through_store(&store_run, &vendor_dir, p);
+                    let archive = archives.remove(&p.unique_name()).map(|d| d.archive);
+                    (p, path, archive, via_store)
+                })
+                .collect();
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let run = store_run.as_ref();
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut done = Vec::new();
+                            while let Some((p, path, archive, via_store)) =
+                                jobs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                let store = run.filter(|_| *via_store);
+                                let path = Path::new(path);
+                                let result = prepare(store, &vendor_dir, p, path, archive.clone());
+                                done.push((p.unique_name(), result));
+                            }
+                            done
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    prepared.extend(worker.join().unwrap());
+                }
+            });
+        }
+
         // pre events fire as each operation starts, post events once its batch is done; plugins
         // and installers get a batch of their own
         let mut post_events: Vec<&str> = Vec::new();
-        for op in operations {
-            let (event, plugin) = match op {
-                Operation::Install(p) => ("package-install", Some(p)),
-                Operation::Update { target, .. } => ("package-update", Some(target)),
-                Operation::Uninstall(_) => ("package-uninstall", None),
-                _ => ("", None),
-            };
-            let plugin = plugin
-                .filter(|p| matches!(p.kind.as_str(), "composer-plugin" | "composer-installer"));
-            if plugin.is_some() {
-                self.fire_post_events(&mut post_events)?;
-            }
-            if !event.is_empty() && self.options.run_scripts {
-                crate::scripts::fire(self.io, self.config, self.root, &format!("pre-{event}"))?;
-                post_events.push(event);
-            }
-            match op {
-                Operation::Install(package) if package.kind == "metapackage" => {
-                    // `MetapackageInstaller`: nothing on disk
-                    self.io.error(&format!("  - {}", label(package, None)));
-                    if !local_repo.has_package(package) {
-                        local_repo.add_package(package.clone());
-                    }
+        let result = (|| -> Result<(), String> {
+            for op in operations {
+                let (event, plugin) = match op {
+                    Operation::Install(p) => ("package-install", Some(p)),
+                    Operation::Update { target, .. } => ("package-update", Some(target)),
+                    Operation::Uninstall(_) => ("package-uninstall", None),
+                    _ => ("", None),
+                };
+                let plugin = plugin.filter(|p| {
+                    matches!(p.kind.as_str(), "composer-plugin" | "composer-installer")
+                });
+                if plugin.is_some() {
+                    self.fire_post_events(&mut post_events)?;
                 }
-                Operation::Install(package) => {
-                    let path = install_path(&vendor_dir, package).unwrap();
-                    if !Path::new(&path).exists() && local_repo.has_package(package) {
-                        binaries.remove_binaries(package)?;
-                    }
-                    if let Some(run) = &mut store_run {
-                        run.manifest.forget(&package.name);
-                    }
-                    let source = from_source(package);
-                    if !source && dist_kind(package) == "path" {
-                        crate::path_repo::install(
-                            self.io,
-                            package,
-                            Path::new(&path),
-                            Some(&label(package, None)),
-                        )?;
-                    } else if source {
-                        crate::git::install(
-                            self.io,
-                            self.config,
-                            package,
-                            Path::new(&path),
-                            &label(package, None),
-                            cached[&package.unique_name()],
-                        )?;
-                    } else {
-                        self.install_code(
-                            &mut store_run,
-                            &mut downloader,
-                            &mut archives,
-                            package,
-                            Path::new(&path),
-                            &vendor_dir,
-                            None,
-                        )?;
-                    }
-                    binaries.install_binaries(self.io, package, Path::new(&path), true)?;
-                    if !local_repo.has_package(package) {
-                        let mut installed = package.clone();
-                        installed.installation_source =
-                            Some(if source { "source" } else { "dist" }.into());
-                        local_repo.add_package(installed);
-                    }
-                    downloader.cleanup(package, Path::new(&path));
+                if !event.is_empty() && self.options.run_scripts {
+                    crate::scripts::fire(self.io, self.config, self.root, &format!("pre-{event}"))?;
+                    post_events.push(event);
                 }
-                Operation::Update { initial, target }
-                    if initial.kind == "metapackage" || target.kind == "metapackage" =>
-                {
-                    // ponytail: a library becoming a metapackage (or back) is updated in place,
-                    // Composer uninstalls and installs as the installer type changes
-                    if let Some(path) = install_path(&vendor_dir, initial) {
-                        binaries.remove_binaries(initial)?;
-                        remove(Path::new(&path))?;
-                    }
-                    self.io
-                        .error(&format!("  - {}", label(target, Some(initial))));
-                    local_repo.remove_package(initial);
-                    if !local_repo.has_package(target) {
-                        local_repo.add_package(target.clone());
-                    }
-                }
-                Operation::Update { initial, target } => {
-                    let initial_path = install_path(&vendor_dir, initial).unwrap();
-                    let target_path = install_path(&vendor_dir, target).unwrap();
-                    let source = from_source(target);
-                    let was_source = initial.installation_source.as_deref() == Some("source");
-                    if let Some(run) = &mut store_run {
-                        run.manifest.forget(&target.name);
-                    }
-                    let from_path = !was_source && dist_kind(initial) == "path";
-                    let to_path = !source && dist_kind(target) == "path";
-                    // a source checkout is only replaced once its local changes are dealt with
-                    let forced = if was_source {
-                        crate::git::clean_changes(self.config, Path::new(&initial_path), source)?
-                    } else {
-                        false
-                    };
-                    binaries.remove_binaries(initial)?;
-                    let target_label = label(target, Some(initial));
-                    if source && was_source && initial_path == target_path {
-                        crate::git::update(
-                            self.io,
-                            self.config,
-                            target,
-                            Path::new(&target_path),
-                            &target_label,
-                            cached[&target.unique_name()],
-                            forced,
-                        )?;
-                        crate::git::reapply_changes(
-                            self.io,
-                            self.config,
-                            Path::new(&target_path),
-                            forced,
-                        )?;
-                    } else if to_path && from_path {
-                        // `FileDownloader::update`: one line, then remove and install silently
-                        self.io.error(&format!(
-                            "  - {target_label}{}",
-                            crate::path_repo::appendix(target, Path::new(&target_path))
-                        ));
-                        if !is_own_source(initial, &initial_path) {
-                            remove(Path::new(&initial_path))?;
+                match op {
+                    Operation::Install(package) if package.kind == "metapackage" => {
+                        // `MetapackageInstaller`: nothing on disk
+                        self.io.error(&format!("  - {}", label(package, None)));
+                        if !local_repo.has_package(package) {
+                            local_repo.add_package(package.clone());
                         }
-                        crate::path_repo::install(self.io, target, Path::new(&target_path), None)?;
-                    } else if to_path || from_path {
-                        // the downloader type changed: removal and a fresh install
-                        self.io.error(&format!(
-                            "  - Removing {} ({})",
-                            initial.pretty_name,
-                            initial.full_pretty_version()
-                        ));
-                        if !is_own_source(initial, &initial_path) {
-                            remove(Path::new(&initial_path))?;
+                    }
+                    Operation::Install(package) => {
+                        let path = install_path(&vendor_dir, package).unwrap();
+                        // a prepared package's dir only exists because the prepare step made it
+                        let fresh = prepared.contains_key(&package.unique_name())
+                            || !Path::new(&path).exists();
+                        if fresh && local_repo.has_package(package) {
+                            binaries.remove_binaries(package)?;
                         }
-                        if to_path {
+                        if let Some(run) = &mut store_run {
+                            run.manifest.forget(&package.name);
+                        }
+                        let source = from_source(package);
+                        if !source && dist_kind(package) == "path" {
                             crate::path_repo::install(
                                 self.io,
-                                target,
-                                Path::new(&target_path),
-                                Some(&label(target, None)),
+                                package,
+                                Path::new(&path),
+                                Some(&label(package, None)),
                             )?;
                         } else if source {
                             crate::git::install(
                                 self.io,
                                 self.config,
-                                target,
-                                Path::new(&target_path),
-                                &label(target, None),
-                                cached[&target.unique_name()],
+                                package,
+                                Path::new(&path),
+                                &label(package, None),
+                                cached[&package.unique_name()],
                             )?;
                         } else {
                             self.install_code(
                                 &mut store_run,
                                 &mut downloader,
                                 &mut archives,
-                                target,
-                                Path::new(&target_path),
+                                &mut prepared,
+                                package,
+                                Path::new(&path),
                                 &vendor_dir,
                                 None,
                             )?;
                         }
-                    } else {
-                        remove(Path::new(&initial_path))?;
-                        if source {
-                            crate::git::install(
+                        binaries.install_binaries(self.io, package, Path::new(&path), true)?;
+                        if !local_repo.has_package(package) {
+                            let mut installed = package.clone();
+                            installed.installation_source =
+                                Some(if source { "source" } else { "dist" }.into());
+                            local_repo.add_package(installed);
+                        }
+                        downloader.cleanup(package, Path::new(&path));
+                    }
+                    Operation::Update { initial, target }
+                        if initial.kind == "metapackage" || target.kind == "metapackage" =>
+                    {
+                        // ponytail: a library becoming a metapackage (or back) is updated in place,
+                        // Composer uninstalls and installs as the installer type changes
+                        if let Some(path) = install_path(&vendor_dir, initial) {
+                            binaries.remove_binaries(initial)?;
+                            remove(Path::new(&path))?;
+                        }
+                        self.io
+                            .error(&format!("  - {}", label(target, Some(initial))));
+                        local_repo.remove_package(initial);
+                        if !local_repo.has_package(target) {
+                            local_repo.add_package(target.clone());
+                        }
+                    }
+                    Operation::Update { initial, target } => {
+                        let initial_path = install_path(&vendor_dir, initial).unwrap();
+                        let target_path = install_path(&vendor_dir, target).unwrap();
+                        let source = from_source(target);
+                        let was_source = initial.installation_source.as_deref() == Some("source");
+                        if let Some(run) = &mut store_run {
+                            run.manifest.forget(&target.name);
+                        }
+                        let from_path = !was_source && dist_kind(initial) == "path";
+                        let to_path = !source && dist_kind(target) == "path";
+                        // a source checkout is only replaced once its local changes are dealt with
+                        let forced = if was_source {
+                            crate::git::clean_changes(
+                                self.config,
+                                Path::new(&initial_path),
+                                source,
+                            )?
+                        } else {
+                            false
+                        };
+                        binaries.remove_binaries(initial)?;
+                        let target_label = label(target, Some(initial));
+                        if source && was_source && initial_path == target_path {
+                            crate::git::update(
                                 self.io,
                                 self.config,
                                 target,
                                 Path::new(&target_path),
                                 &target_label,
                                 cached[&target.unique_name()],
+                                forced,
                             )?;
-                        } else {
-                            self.install_code(
-                                &mut store_run,
-                                &mut downloader,
-                                &mut archives,
+                            crate::git::reapply_changes(
+                                self.io,
+                                self.config,
+                                Path::new(&target_path),
+                                forced,
+                            )?;
+                        } else if to_path && from_path {
+                            // `FileDownloader::update`: one line, then remove and install silently
+                            self.io.error(&format!(
+                                "  - {target_label}{}",
+                                crate::path_repo::appendix(target, Path::new(&target_path))
+                            ));
+                            if !is_own_source(initial, &initial_path) {
+                                remove(Path::new(&initial_path))?;
+                            }
+                            crate::path_repo::install(
+                                self.io,
                                 target,
                                 Path::new(&target_path),
-                                &vendor_dir,
-                                Some(initial),
+                                None,
                             )?;
+                        } else if to_path || from_path {
+                            // the downloader type changed: removal and a fresh install
+                            self.io.error(&format!(
+                                "  - Removing {} ({})",
+                                initial.pretty_name,
+                                initial.full_pretty_version()
+                            ));
+                            if !is_own_source(initial, &initial_path) {
+                                remove(Path::new(&initial_path))?;
+                            }
+                            if to_path {
+                                crate::path_repo::install(
+                                    self.io,
+                                    target,
+                                    Path::new(&target_path),
+                                    Some(&label(target, None)),
+                                )?;
+                            } else if source {
+                                crate::git::install(
+                                    self.io,
+                                    self.config,
+                                    target,
+                                    Path::new(&target_path),
+                                    &label(target, None),
+                                    cached[&target.unique_name()],
+                                )?;
+                            } else {
+                                self.install_code(
+                                    &mut store_run,
+                                    &mut downloader,
+                                    &mut archives,
+                                    &mut prepared,
+                                    target,
+                                    Path::new(&target_path),
+                                    &vendor_dir,
+                                    None,
+                                )?;
+                            }
+                        } else {
+                            remove(Path::new(&initial_path))?;
+                            if source {
+                                crate::git::install(
+                                    self.io,
+                                    self.config,
+                                    target,
+                                    Path::new(&target_path),
+                                    &target_label,
+                                    cached[&target.unique_name()],
+                                )?;
+                            } else {
+                                self.install_code(
+                                    &mut store_run,
+                                    &mut downloader,
+                                    &mut archives,
+                                    &mut prepared,
+                                    target,
+                                    Path::new(&target_path),
+                                    &vendor_dir,
+                                    Some(initial),
+                                )?;
+                            }
                         }
-                    }
-                    binaries.install_binaries(self.io, target, Path::new(&target_path), true)?;
-                    local_repo.remove_package(initial);
-                    if !local_repo.has_package(target) {
-                        let mut installed = target.clone();
-                        installed.installation_source =
-                            Some(if source { "source" } else { "dist" }.into());
-                        local_repo.add_package(installed);
-                    }
-                    downloader.cleanup(target, Path::new(&target_path));
-                }
-                Operation::Uninstall(package) => {
-                    let path = install_path(&vendor_dir, package);
-                    let own_source = path.as_ref().is_some_and(|p| is_own_source(package, p));
-                    self.io.error(&format!(
-                        "  - Removing {} ({}){}",
-                        package.pretty_name,
-                        package.full_pretty_version(),
-                        match (&path, own_source) {
-                            (Some(p), true) => format!(", source is still present in {p}"),
-                            _ => String::new(),
+                        binaries.install_binaries(
+                            self.io,
+                            target,
+                            Path::new(&target_path),
+                            true,
+                        )?;
+                        local_repo.remove_package(initial);
+                        if !local_repo.has_package(target) {
+                            let mut installed = target.clone();
+                            installed.installation_source =
+                                Some(if source { "source" } else { "dist" }.into());
+                            local_repo.add_package(installed);
                         }
-                    ));
-                    if let Some(path) = path.filter(|_| !own_source) {
-                        if package.installation_source.as_deref() == Some("source") {
-                            crate::git::clean_changes(self.config, Path::new(&path), false)?;
-                        }
-                        remove(Path::new(&path))?;
-                        binaries.remove_binaries(package)?;
-                        if let Some(parent) = Path::new(&path).parent()
-                            && package.name.contains('/')
-                            && parent.is_dir()
-                            && is_dir_empty(parent)
-                        {
-                            let _ = std::fs::remove_dir(parent);
-                        }
+                        downloader.cleanup(target, Path::new(&target_path));
                     }
-                    local_repo.remove_package(package);
-                }
-                Operation::MarkAliasInstalled(package) => {
-                    if !local_repo.has_package(package) {
-                        local_repo.add_package(package.clone());
-                    }
-                }
-                Operation::MarkAliasUninstalled(package) => local_repo.remove_package(package),
-            }
-            self.write_local_repo(local_repo, &vendor_dir)?;
-            if let Some(plugin) = plugin {
-                // ponytail: plugins are installed, never activated; the warning stands in for
-                // `PluginManager::registerPackage`
-                if plugin.kind == "composer-plugin" {
-                    if crate::scripts::NO_PLUGINS.load(std::sync::atomic::Ordering::Relaxed) {
-                        self.io.warning(&format!(
-                            "The \"{}\" plugin was not loaded as plugins are disabled.",
-                            plugin.name
+                    Operation::Uninstall(package) => {
+                        let path = install_path(&vendor_dir, package);
+                        let own_source = path.as_ref().is_some_and(|p| is_own_source(package, p));
+                        self.io.error(&format!(
+                            "  - Removing {} ({}){}",
+                            package.pretty_name,
+                            package.full_pretty_version(),
+                            match (&path, own_source) {
+                                (Some(p), true) => format!(", source is still present in {p}"),
+                                _ => String::new(),
+                            }
                         ));
-                    } else {
-                        self.io.warning(&format!(
+                        if let Some(path) = path.filter(|_| !own_source) {
+                            if package.installation_source.as_deref() == Some("source") {
+                                crate::git::clean_changes(self.config, Path::new(&path), false)?;
+                            }
+                            remove(Path::new(&path))?;
+                            binaries.remove_binaries(package)?;
+                            if let Some(parent) = Path::new(&path).parent()
+                                && package.name.contains('/')
+                                && parent.is_dir()
+                                && is_dir_empty(parent)
+                            {
+                                let _ = std::fs::remove_dir(parent);
+                            }
+                        }
+                        local_repo.remove_package(package);
+                    }
+                    Operation::MarkAliasInstalled(package) => {
+                        if !local_repo.has_package(package) {
+                            local_repo.add_package(package.clone());
+                        }
+                    }
+                    Operation::MarkAliasUninstalled(package) => local_repo.remove_package(package),
+                }
+                self.write_local_repo(local_repo, &vendor_dir)?;
+                if let Some(plugin) = plugin {
+                    // ponytail: plugins are installed, never activated; the warning stands in for
+                    // `PluginManager::registerPackage`
+                    if plugin.kind == "composer-plugin" {
+                        if crate::scripts::NO_PLUGINS.load(std::sync::atomic::Ordering::Relaxed) {
+                            self.io.warning(&format!(
+                                "The \"{}\" plugin was not loaded as plugins are disabled.",
+                                plugin.name
+                            ));
+                        } else {
+                            self.io.warning(&format!(
                             "{} is a Composer plugin: romposer installed it but does not execute plugins",
                             plugin.pretty_name
                         ));
+                        }
+                    }
+                    self.fire_post_events(&mut post_events)?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // ponytail: prepared packages past the failure leave vendor as the sequential run
+            // would, but their store entries stay ingested and their archives are gone
+            for op in operations {
+                if let Operation::Install(p) = op
+                    && prepared.contains_key(&p.unique_name())
+                    && let Some(path) = install_path(&vendor_dir, p)
+                {
+                    let mut dir = Path::new(&path);
+                    let _ = remove(dir);
+                    while let Some(parent) = dir.parent().filter(|d| *d != Path::new(&vendor_dir)) {
+                        if std::fs::remove_dir(parent).is_err() {
+                            break;
+                        }
+                        dir = parent;
                     }
                 }
-                self.fire_post_events(&mut post_events)?;
             }
         }
+        result?;
         self.fire_post_events(&mut post_events)?;
         // do a last write so that we write the repository even if nothing changed
         self.write_local_repo(local_repo, &vendor_dir)?;
@@ -1684,40 +1801,92 @@ impl FilesystemRun<'_> {
         Ok(())
     }
 
-    /// `ArchiveDownloader::install` or `StoreZipDownloader::install` for one package.
+    /// `ArchiveDownloader::install` or `StoreZipDownloader::install` for one package, its disk
+    /// work taken from `prepared` when the prepare step already did it.
     #[allow(clippy::too_many_arguments)]
     fn install_code(
         &mut self,
         store_run: &mut Option<StoreRun>,
         downloader: &mut Downloader,
-        archives: &mut std::collections::HashMap<String, crate::download::Downloaded>,
+        archives: &mut HashMap<String, Downloaded>,
+        prepared: &mut HashMap<String, Prepared>,
         package: &Package,
         path: &Path,
         vendor_dir: &str,
         initial: Option<&Package>,
     ) -> Result<(), String> {
         let label = label(package, initial);
-        if !goes_through_store(store_run, vendor_dir, package) {
-            self.io.error(&format!("  - {label}: Extracting archive"));
-            let archive = archives
-                .remove(&package.unique_name())
-                .ok_or("missing download")?
-                .archive;
-            return downloader.install_archive(package, &archive, path);
+        let done = prepared.remove(&package.unique_name()).unwrap_or_else(|| {
+            let via_store = goes_through_store(store_run, vendor_dir, package);
+            let archive = archives.remove(&package.unique_name()).map(|d| d.archive);
+            prepare(
+                store_run.as_ref().filter(|_| via_store),
+                vendor_dir,
+                package,
+                path,
+                archive,
+            )
+        });
+        self.io.error(&match done.via_store {
+            false => format!("  - {label}: Extracting archive"),
+            true => format!(
+                "  - {label}: Linking from store{}",
+                if done.cached { " (cached)" } else { "" }
+            ),
+        });
+        let used = done.result.inspect_err(|_| {
+            if !done.via_store {
+                downloader.forget_cache_write(package);
+            }
+        })?;
+        if let (Some(run), Some((used, fallback))) = (store_run.as_mut(), used) {
+            if !run.fallback_warned
+                && let Some(reason) = fallback
+            {
+                run.fallback_warned = true;
+                let wanted = run.config.strategy_for(&package.name, &package.kind);
+                self.io.error(&format!(
+                    "pcomposer: {wanted} failed ({reason}), falling back to copy for this run"
+                ));
+            }
+            run.manifest.record(package, used.as_str());
         }
-        let run = store_run.as_mut().unwrap();
-        let key = Store::key(package);
-        let cached = run.store.has(&key);
-        self.io.error(&format!(
-            "  - {label}: Linking from store{}",
-            if cached { " (cached)" } else { "" }
-        ));
+        Ok(())
+    }
+}
+
+/// The disk work of `install_code` for one package: no output and no `&mut`, so the prepare
+/// step runs it for many packages at once. `store` is set when the package goes through it.
+struct Prepared {
+    via_store: bool,
+    cached: bool,
+    result: Result<Option<(Strategy, Option<String>)>, String>,
+}
+
+fn prepare(
+    store: Option<&StoreRun>,
+    vendor_dir: &str,
+    package: &Package,
+    path: &Path,
+    archive: Option<PathBuf>,
+) -> Prepared {
+    let Some(run) = store else {
+        let result = archive
+            .ok_or_else(|| "missing download".to_string())
+            .and_then(|archive| extract_archive(vendor_dir, package, &archive, path))
+            .map(|()| None);
+        return Prepared {
+            via_store: false,
+            cached: false,
+            result,
+        };
+    };
+    let key = Store::key(package);
+    let cached = run.store.has(&key);
+    let result = (|| {
         crate::fs::empty_directory(path)?;
         if !cached {
-            let archive = archives
-                .remove(&package.unique_name())
-                .ok_or("missing download")?
-                .archive;
+            let archive = archive.ok_or("missing download")?;
             let parent = path.parent().unwrap_or(Path::new(vendor_dir));
             let result = match ingest_zip(&archive, &run.store, &key) {
                 Ok(true) => remove(&archive),
@@ -1730,19 +1899,14 @@ impl FilesystemRun<'_> {
             }
         }
         let wanted = run.config.strategy_for(&package.name, &package.kind);
-        let used = run
-            .store
-            .materialise(&key, path, wanted, &package.binaries)?;
-        if !run.fallback_warned
-            && let Some(reason) = run.store.fallback_reason()
-        {
-            run.fallback_warned = true;
-            self.io.error(&format!(
-                "pcomposer: {wanted} failed ({reason}), falling back to copy for this run"
-            ));
-        }
-        run.manifest.record(package, used.as_str());
-        Ok(())
+        run.store
+            .materialise(&key, path, wanted, &package.binaries)
+            .map(Some)
+    })();
+    Prepared {
+        via_store: true,
+        cached,
+        result,
     }
 }
 

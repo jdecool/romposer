@@ -560,70 +560,20 @@ impl Downloader {
         archive: &Path,
         path: &Path,
     ) -> Result<(), String> {
-        let vendor = normalize_path(&self.vendor_dir);
-        let path_str = normalize_path(&path.to_string_lossy());
-        if !vendor.starts_with(&format!("{path_str}/")) {
-            empty_directory(path)?;
+        let result = extract_archive(&self.vendor_dir, package, archive, path);
+        if result.is_err() {
+            self.forget_cache_write(package);
         }
-        let mut temporary_dir;
-        loop {
-            temporary_dir = PathBuf::from(format!(
-                "{}/composer/{}",
-                self.vendor_dir,
-                crate::fs::random_hex(4)
-            ));
-            if !temporary_dir.is_dir() {
-                break;
-            }
+        result
+    }
+
+    /// A failed extraction drops the archive this run wrote to the zip cache.
+    pub fn forget_cache_write(&mut self, package: &Package) {
+        if let Some(key) = self.last_cache_writes.remove(&package.name)
+            && let Some(cache) = self.cache_path(&key)
+        {
+            let _ = remove(&cache);
         }
-        ensure_dir(&temporary_dir)?;
-        let result = extract(package, archive, &temporary_dir).and_then(|()| {
-            let _ = remove(archive);
-            // if the target is clear, the whole package is renamed in one go
-            let rename_as_one =
-                !path.exists() || (is_dir_empty(path) && std::fs::remove_dir(path).is_ok());
-            let content: Vec<PathBuf> = std::fs::read_dir(&temporary_dir)
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    !p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| METADATA_NAME.is_match(n))
-                })
-                .collect();
-            let single_dir = content.len() == 1 && content[0].is_dir();
-            if rename_as_one {
-                let extracted = if single_dir {
-                    content[0].clone()
-                } else {
-                    temporary_dir.clone()
-                };
-                rename(&extracted, path)?;
-            } else {
-                let from = if single_dir {
-                    content[0].clone()
-                } else {
-                    temporary_dir.clone()
-                };
-                rename_recursively(package, &from, path)?;
-            }
-            let _ = remove(&temporary_dir);
-            Ok(())
-        });
-        if let Err(e) = result {
-            if let Some(key) = self.last_cache_writes.remove(&package.name)
-                && let Some(cache) = self.cache_path(&key)
-            {
-                let _ = remove(&cache);
-            }
-            let _ = remove(&temporary_dir);
-            if path.is_dir() && realpath(path) != crate::fs::cwd() {
-                let _ = remove(path);
-            }
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// `FileDownloader::cleanup`: drop the archive and empty directories left behind.
@@ -643,6 +593,75 @@ impl Downloader {
             }
         }
     }
+}
+
+/// `Downloader::install_archive` without the zip cache bookkeeping: takes no `&mut`, so
+/// packages can extract concurrently.
+pub fn extract_archive(
+    vendor_dir: &str,
+    package: &Package,
+    archive: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let vendor = normalize_path(vendor_dir);
+    let path_str = normalize_path(&path.to_string_lossy());
+    if !vendor.starts_with(&format!("{path_str}/")) {
+        empty_directory(path)?;
+    }
+    let mut temporary_dir;
+    loop {
+        temporary_dir = PathBuf::from(format!(
+            "{}/composer/{}",
+            vendor_dir,
+            crate::fs::random_hex(4)
+        ));
+        if !temporary_dir.is_dir() {
+            break;
+        }
+    }
+    ensure_dir(&temporary_dir)?;
+    let result = extract(package, archive, &temporary_dir).and_then(|()| {
+        let _ = remove(archive);
+        // if the target is clear, the whole package is renamed in one go
+        let rename_as_one =
+            !path.exists() || (is_dir_empty(path) && std::fs::remove_dir(path).is_ok());
+        let content: Vec<PathBuf> = std::fs::read_dir(&temporary_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| METADATA_NAME.is_match(n))
+            })
+            .collect();
+        let single_dir = content.len() == 1 && content[0].is_dir();
+        if rename_as_one {
+            let extracted = if single_dir {
+                content[0].clone()
+            } else {
+                temporary_dir.clone()
+            };
+            rename(&extracted, path)?;
+        } else {
+            let from = if single_dir {
+                content[0].clone()
+            } else {
+                temporary_dir.clone()
+            };
+            rename_recursively(package, &from, path)?;
+        }
+        let _ = remove(&temporary_dir);
+        Ok(())
+    });
+    if let Err(e) = result {
+        let _ = remove(&temporary_dir);
+        if path.is_dir() && realpath(path) != crate::fs::cwd() {
+            let _ = remove(path);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn rename(from: &Path, to: &Path) -> Result<(), String> {

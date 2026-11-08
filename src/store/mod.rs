@@ -38,13 +38,12 @@ pub struct IndexEntry {
 }
 
 /// Hard link or clone, injectable so the fallback path can be tested.
-pub type Linker = Box<dyn Fn(&Path, &Path) -> std::io::Result<()>>;
+pub type Linker = Box<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
 
 pub struct Store {
     root: PathBuf,
     linker: Linker,
     cloner: Linker,
-    fallback_reason: Option<String>,
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -122,7 +121,6 @@ impl Store {
             root: root.into(),
             linker,
             cloner,
-            fallback_reason: None,
         }
     }
 
@@ -442,47 +440,43 @@ impl Store {
     }
 
     /// Materialises the `key` entry into `target` with the strategy, refreshing the entry's mtime
-    /// (prune's "last used"). Returns the strategy actually used.
+    /// (prune's "last used"). Returns the strategy actually used and, when it fell back to copy,
+    /// why. Takes `&self` so packages can materialise concurrently.
     pub fn materialise(
-        &mut self,
+        &self,
         key: &str,
         target: &Path,
         strategy: Strategy,
         copy: &[String],
-    ) -> Result<Strategy, String> {
+    ) -> Result<(Strategy, Option<String>), String> {
         let index = self.index_path(key)?;
         let _ = std::fs::File::open(&index).and_then(|f| f.set_modified(SystemTime::now()));
-        match strategy {
-            Strategy::Hardlink if self.can_materialise_into(key, target, strategy)? => {
-                self.link(key, target, copy)?;
-                Ok(Strategy::Hardlink)
-            }
-            Strategy::Reflink if self.can_materialise_into(key, target, strategy)? => {
-                self.clone_into(key, target, copy)?;
-                Ok(Strategy::Reflink)
-            }
+        let fallback = match strategy {
+            Strategy::Copy => None,
+            _ => self.probe(key, target, strategy)?,
+        };
+        match (strategy, &fallback) {
+            (Strategy::Hardlink, None) => self.link(key, target, copy)?,
+            (Strategy::Reflink, None) => self.clone_into(key, target, copy)?,
             _ => {
                 self.copy(key, target)?;
-                Ok(Strategy::Copy)
+                return Ok((Strategy::Copy, fallback));
             }
         }
-    }
-
-    /// Why the first materialisation of this run fell back to copy, if any did.
-    pub fn fallback_reason(&self) -> Option<&str> {
-        self.fallback_reason.as_deref()
+        Ok((strategy, None))
     }
 
     /// Tries the entry's first file against a probe path: no upfront filesystem detection.
-    fn can_materialise_into(
-        &mut self,
+    /// Returns why the strategy cannot be used, if it cannot.
+    fn probe(
+        &self,
         key: &str,
         target: &Path,
         strategy: Strategy,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         let entry = self.entry(key)?;
         let Some((_, first)) = entry.files.iter().next() else {
-            return Ok(true);
+            return Ok(None);
         };
         let source = self.file_path_for(first);
         ensure_dir(target)?;
@@ -498,11 +492,7 @@ impl Store {
         };
         let result = op(&source, &probe);
         let _ = std::fs::remove_file(&probe);
-        if let Err(e) = result {
-            self.fallback_reason.get_or_insert_with(|| e.to_string());
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(result.err().map(|e| e.to_string()))
     }
 
     /// Files hard-linked (declared bins copied), empty directories created, symlinks recreated.
@@ -853,7 +843,7 @@ mod tests {
         let base = temp("materialise");
         let pkg = base.join("pkg");
         sample_package(&pkg);
-        let mut store = Store::new(base.join("store"));
+        let store = Store::new(base.join("store"));
         store.ingest("acme/lib@1.0.0.0-abc", &pkg).unwrap();
         let target = base.join("vendor/acme/lib");
         let used = store
@@ -864,7 +854,7 @@ mod tests {
                 &["bin/run".into()],
             )
             .unwrap();
-        assert_eq!(used, Strategy::Hardlink);
+        assert_eq!(used, (Strategy::Hardlink, None));
         let entry = store.entry("acme/lib@1.0.0.0-abc").unwrap();
         let stored = store.file_path_for(&entry.files["src/A.php"]);
         assert_eq!(
@@ -903,13 +893,12 @@ mod tests {
         assert!(!target.join(".pcomposer-probe").exists());
 
         let failing: Linker = Box::new(|_, _| Err(std::io::Error::other("Cross-device link")));
-        let mut store2 = Store::with_operations(base.join("store"), failing, Box::new(reflink));
+        let store2 = Store::with_operations(base.join("store"), failing, Box::new(reflink));
         let target2 = base.join("vendor2/acme/lib");
         let used = store2
             .materialise("acme/lib@1.0.0.0-abc", &target2, Strategy::Hardlink, &[])
             .unwrap();
-        assert_eq!(used, Strategy::Copy);
-        assert_eq!(store2.fallback_reason(), Some("Cross-device link"));
+        assert_eq!(used, (Strategy::Copy, Some("Cross-device link".into())));
         assert_ne!(
             std::fs::metadata(&stored).unwrap().ino(),
             std::fs::metadata(target2.join("src/A.php")).unwrap().ino()
@@ -929,16 +918,16 @@ mod tests {
         let base = temp("reflink");
         let pkg = base.join("pkg");
         sample_package(&pkg);
-        let mut store = Store::new(base.join("store"));
+        let store = Store::new(base.join("store"));
         store.ingest("acme/lib@1.0.0.0-abc", &pkg).unwrap();
         let target = base.join("vendor/acme/lib");
-        let used = store
+        let (used, fallback) = store
             .materialise("acme/lib@1.0.0.0-abc", &target, Strategy::Reflink, &[])
             .unwrap();
         // the temp dir may or may not support clones; either outcome must be consistent
         match used {
             Strategy::Reflink => {
-                assert!(store.fallback_reason().is_none());
+                assert!(fallback.is_none());
                 assert_eq!(
                     std::fs::metadata(target.join("src/A.php"))
                         .unwrap()
@@ -948,7 +937,7 @@ mod tests {
                     0o644
                 );
             }
-            Strategy::Copy => assert!(store.fallback_reason().is_some()),
+            Strategy::Copy => assert!(fallback.is_some()),
             Strategy::Hardlink => panic!("reflink never degrades to hardlink"),
         }
         assert_eq!(
@@ -1023,7 +1012,7 @@ mod tests {
         let base = temp("unlink");
         let pkg = base.join("pkg");
         sample_package(&pkg);
-        let mut store = Store::new(base.join("store"));
+        let store = Store::new(base.join("store"));
         store.ingest("acme/lib@1.0.0.0-abc", &pkg).unwrap();
         let target = base.join("vendor/acme/lib");
         store

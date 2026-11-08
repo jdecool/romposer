@@ -501,3 +501,90 @@ fn reflink_falls_back_to_copy_on_a_non_apfs_volume() {
             .contains("\"strategy\": \"copy\"")
     );
 }
+
+/// Packages are prepared ahead of the loop, but a failure still stops the install where the
+/// sequential one does: the first failing package in order reports, later ones never appear.
+#[test]
+fn a_failing_package_stops_the_install_at_the_first_failure_in_order() {
+    let root = temp_dir("store-failure");
+    let dists = root.join("dists");
+    let mut packages = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let work = root.join("work").join(name);
+        fs::create_dir_all(work.join("src")).unwrap();
+        fs::write(work.join("src/X.php"), format!("<?php // {name}\n")).unwrap();
+        fs::write(work.join("composer.json"), "{}").unwrap();
+        fs::create_dir_all(&dists).unwrap();
+        let zip = dists.join(format!("{name}.zip"));
+        let out = std::process::Command::new("zip")
+            .args(["-qr", zip.to_str().unwrap(), "."])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        if name == "b" || name == "c" {
+            // valid for the download check, refused on extraction
+            let out = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sys, zipfile; zipfile.ZipFile(sys.argv[1], 'w').writestr('../evil.txt', 'x')",
+                    zip.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        packages.push(format!(
+            r#"{{"name":"acme/{name}","version":"1.0.0","dist":{{"type":"zip","url":"{}"}}}}"#,
+            zip.display()
+        ));
+    }
+    let proj = root.join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(
+        proj.join("composer.json"),
+        format!(
+            r#"{{"repositories":[{{"packagist.org":false}},{{"type":"package","package":[{}]}}],
+"require":{{"acme/a":"*","acme/b":"*","acme/c":"*","acme/d":"*"}}}}"#,
+            packages.join(",")
+        ),
+    )
+    .unwrap();
+    for disable in ["", "1"] {
+        let _ = fs::remove_dir_all(proj.join("vendor"));
+        let store = root.join("store");
+        let mut env = vec![("PCOMPOSER_STORE", store.to_str().unwrap())];
+        if !disable.is_empty() {
+            env.push(("PCOMPOSER_DISABLE", disable));
+        }
+        let out = run_env(&romposer(), &proj, &["install", "--no-progress"], &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        let installing: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("  - Installing"))
+            .collect();
+        assert_eq!(installing.len(), 2, "{stderr}");
+        assert!(
+            installing[0].starts_with("  - Installing acme/a (1.0.0): "),
+            "{stderr}"
+        );
+        assert!(
+            installing[1].starts_with("  - Installing acme/b (1.0.0): "),
+            "{stderr}"
+        );
+        assert!(stderr.contains("invalid entry name"), "{stderr}");
+        assert!(proj.join("vendor/acme/a/src/X.php").is_file());
+        for later in ["b", "c", "d"] {
+            assert!(
+                !proj.join("vendor/acme").join(later).exists(),
+                "{later}: {stderr}"
+            );
+        }
+        assert!(
+            !fs::read_to_string(proj.join("vendor/composer/installed.json"))
+                .unwrap()
+                .contains("acme/d")
+        );
+    }
+}

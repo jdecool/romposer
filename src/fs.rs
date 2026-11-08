@@ -195,7 +195,8 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     if dir.is_dir() {
         return Ok(());
     }
-    if dir.exists() {
+    // rechecked: another thread may have just created it
+    if dir.exists() && !dir.is_dir() {
         return Err(format!("{} exists and is not a directory.", dir.display()));
     }
     std::fs::create_dir_all(dir).map_err(|e| {
@@ -259,6 +260,20 @@ pub fn cwd() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_dir_tolerates_a_concurrent_creation() {
+        let base = std::env::temp_dir().join(format!("romposer-ensure-{}", std::process::id()));
+        for round in 0..200 {
+            let dir = base.join(format!("{round}/a/b"));
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| ensure_dir(&dir).unwrap());
+                }
+            });
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     // Fixtures from Composer's tests/Composer/Test/Util/FilesystemTest.php.
     #[test]
