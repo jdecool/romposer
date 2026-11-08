@@ -26,7 +26,7 @@
 
 ## Optimisations
 
-Before these changes, romposer with the store took 51.04 s cold and 9.34 s warm.
+Before these changes, romposer with the store took 51.04 s cold and 9.34 s warm. How each one works: [optimizations.md](optimizations.md).
 
 | commit | change |
 |---|---|
